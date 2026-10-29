@@ -21,6 +21,8 @@ export type Skill = {
   metadata: Record<string, string>;
   /** The instructions: SKILL.md after its frontmatter */
   instructions: string;
+  /** The whole text of SKILL.md, e.g. to remember the skill */
+  skillMd: string;
   /** The other files, by path inside the skill's folder, e.g. "scripts/stats.js" */
   files: Map<string, Blob>;
   /** What was ignored in SKILL.md, for the panel */
@@ -408,6 +410,7 @@ export function createSkill(
       compatibility !== "" && { compatibility }),
     metadata: metadata as Record<string, string>,
     instructions: body,
+    skillMd,
     files,
     warnings:
       unknown.length > 0

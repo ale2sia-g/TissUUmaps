@@ -133,20 +133,17 @@ describe("parseFrontmatter", () => {
 describe("createSkill", () => {
   it("reads the fields and the instructions", () => {
     const files = new Map([["scripts/stats.js", new Blob(["// code"])]]);
-    const skill = createSkill(
-      "data-statistics",
-      skillMd([
-        "name: data-statistics",
-        "description: >",
-        "  Statistics on table columns.",
-        "  Use when the user asks for tests.",
-        "license: MIT",
-        "compatibility: Needs JavaScript",
-        "metadata:",
-        "  version: 1.0",
-      ]),
-      files,
-    );
+    const text = skillMd([
+      "name: data-statistics",
+      "description: >",
+      "  Statistics on table columns.",
+      "  Use when the user asks for tests.",
+      "license: MIT",
+      "compatibility: Needs JavaScript",
+      "metadata:",
+      "  version: 1.0",
+    ]);
+    const skill = createSkill("data-statistics", text, files);
     expect(skill).toEqual({
       name: "data-statistics",
       description:
@@ -155,6 +152,7 @@ describe("createSkill", () => {
       compatibility: "Needs JavaScript",
       metadata: { version: "1.0" },
       instructions: "Do this, then that.",
+      skillMd: text,
       files,
       warnings: [],
     });

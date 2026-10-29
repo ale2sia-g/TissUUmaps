@@ -127,6 +127,14 @@ Then click _Check again_ in the panel. If the browser asks whether the page may 
 
 See also [Ollama's FAQ](https://docs.ollama.com/faq) on `OLLAMA_ORIGINS`.
 
+## Skills
+
+A skill gives the assistant instructions, and maybe scripts, for a task it cannot do on its own, such as an analysis. Skills use the [Agent Skills](https://agentskills.io/specification) format: a folder with a `SKILL.md` file, which starts with the skill's name and description, followed by its instructions. The folder may hold other files, such as scripts.
+
+In the settings (⚙), _Add skill…_ adds the skills of a folder: choose the folder of one skill, or a folder with one folder per skill. The browser may ask whether to upload the files to the page: they stay on your computer. With _Remember this skill_, which is on by default, the browser keeps the skill for the next sessions, in every project, also in projects opened from a website; without it, the skill is kept until the page is closed. Each skill in the list can be turned off and on again, remembered or not (_Remember_), and removed.
+
+A skill must follow the rules of the format: its name is lowercase, with only letters, digits and hyphens, and is also the name of its folder, and it has a description. Fields of `SKILL.md` that are not part of the format, such as those of other agents, are ignored, and the list says so.
+
 ## Limitations
 
 - **Gene names**: genes can be named, as in `X[EPCAM]`, only if TissUUmaps could read the gene names from the index of `var/` of an AnnData table. Otherwise, the genes only have numbers (`X[0]`, `X[1]`, ...), and the project summary says that the gene names are not available.
@@ -165,6 +173,8 @@ The channels of an image are counted like the Images panel counts them: from the
 The result of an action lists exactly what changed, with the value before and after (e.g. `channels[1] (ATP1A1).visibility true → false`), and what already was so; if nothing changes, it says "Nothing changed" and Undo has nothing to take back. Only the settings that really change are changed, so that the model cannot claim more than the action did.
 
 The names, tones and avatars of Dia and Aid, and the words shown while the model thinks, are in `persona.ts`, next to the plugin. The panel uses TissUUmaps' theme colors (CSS variables such as `--foreground` and `--muted`), so that it stays readable with the light and the dark theme.
+
+`SKILL.md` is read and checked in `skills.ts` like the reference validator of the format, [skills-ref](https://github.com/agentskills/agentskills/tree/main/skills-ref), does, except that unknown fields are ignored with a warning. Only the part of YAML that the frontmatter of skills uses is read, so that the plugin needs no YAML library. The skills added with _Remember this skill_ are kept in the browser's IndexedDB, in the database `tissuumaps.ai-chat`, as files rather than as read skills, so that they are read again with the rules of the plugin that opens them.
 
 ---
 

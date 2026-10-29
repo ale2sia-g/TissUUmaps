@@ -27,6 +27,12 @@ import {
   readJsonLines,
 } from "./providers";
 import { loadSetting, saveSetting } from "./settings";
+import { makeSkillList } from "./skill-list";
+import {
+  forgetStoredSkill,
+  loadStoredSkills,
+  storeSkill,
+} from "./skill-storage";
 import { buildContext, exampleRequests, stateJson } from "./summary";
 import {
   describeMatrix,
@@ -244,10 +250,23 @@ export function mountAiChat(
   statusRow.style.cssText = "display: flex; gap: 8px; align-items: center;";
   statusRow.append(status, checkButton);
 
+  // the skills added by hand, remembered by the browser if the user wants
+  const skillList = makeSkillList(
+    { load: loadStoredSkills, save: storeSkill, remove: forgetStoredSkill },
+    updateLayout,
+    { signal },
+  );
+
   const settingsBox = document.createElement("div");
   settingsBox.style.cssText =
     "display: flex; flex-direction: column; gap: 8px;";
-  settingsBox.append(serviceRow, keyRow, statusRow, toolDetailsLabel);
+  settingsBox.append(
+    serviceRow,
+    keyRow,
+    statusRow,
+    toolDetailsLabel,
+    skillList.element,
+  );
 
   const history = document.createElement("div");
   history.style.cssText =
@@ -907,7 +926,8 @@ export function mountAiChat(
     const folded = accepted && !settingsOpen;
     settingsBox.style.display = folded ? "none" : "flex";
     summary.style.display = folded ? "" : "none";
-    summary.textContent = `${provider.name} · ${modelSelect.value} · key ✓`;
+    const skills = skillList.activeSkills().length;
+    summary.textContent = `${provider.name} · ${modelSelect.value} · key ✓${skills > 0 ? ` · ${skills} skill${skills === 1 ? "" : "s"}` : ""}`;
     settingsButton.style.display = accepted ? "" : "none";
     settingsButton.setAttribute("aria-expanded", String(!folded));
   }
