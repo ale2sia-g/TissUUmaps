@@ -8,6 +8,8 @@ import type {
   Shapes,
 } from "@tissuumaps/core";
 
+import type { Skill } from "./skills";
+
 /** The arguments of a tool call, as the model sends them */
 export type ToolArguments = Record<string, unknown>;
 
@@ -69,6 +71,8 @@ export type ToolContext = {
   tables: TableKnowledge;
   /** The changes of the current request, which the tool adds to */
   changes: Change[];
+  /** The skills that are on, for load_skill and read_skill_file */
+  skills: Skill[];
 };
 
 /**

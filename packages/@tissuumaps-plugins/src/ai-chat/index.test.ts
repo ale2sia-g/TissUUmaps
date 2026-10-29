@@ -2909,4 +2909,192 @@ describe("aiChatPlugin", () => {
       expect(panel.texts("You")).toEqual(["Hello"]);
     });
   });
+
+  describe("skills, for OpenAI and Anthropic", () => {
+    const labColors = [
+      "---",
+      "name: lab-colors",
+      "description: The color conventions of our lab. Use when coloring cell types or clusters.",
+      "---",
+      "",
+      "Color T cells blue and B cells orange, as in references/palette.md.",
+      "For the other cell types, also use the skill hello.",
+    ].join("\n");
+    const hello =
+      "---\nname: hello\ndescription: Says hello.\n---\n\nSay ciao.";
+
+    /** Adds skills with "Add skill…", as the browser gives a chosen folder */
+    async function addSkills(
+      container: HTMLElement,
+      files: Record<string, string>,
+    ): Promise<void> {
+      const input =
+        container.querySelector<HTMLInputElement>('input[type="file"]')!;
+      const chosen = Object.entries(files).map(([path, text]) => {
+        const file = new File([text], path.split("/").at(-1)!);
+        Object.defineProperty(file, "webkitRelativePath", { value: path });
+        return file;
+      });
+      Object.defineProperty(input, "files", {
+        value: chosen,
+        configurable: true,
+      });
+      input.dispatchEvent(new Event("change"));
+      await vi.waitFor(() => expect(container.textContent).toContain("Added:"));
+    }
+
+    /** Opens the panel with Anthropic, and the two skills on */
+    async function panelWithSkills() {
+      const panel = await openPanel(undefined, undefined, {
+        provider: "anthropic",
+      });
+      await panel.pasteKey(anthropicKey);
+      await addSkills(panel.container, {
+        "skills/lab-colors/SKILL.md": labColors,
+        "skills/lab-colors/references/palette.md": "T cell: #0000ff",
+        "skills/hello/SKILL.md": hello,
+      });
+      return panel;
+    }
+
+    /**
+     * Turns a skill off in the list; the panel is not in the page, where a
+     * click on a checkbox sends no change event
+     */
+    function turnOff(container: HTMLElement, name: string): void {
+      const box = [...container.querySelectorAll("label")]
+        .find((label) => label.textContent === name)!
+        .querySelector("input")!;
+      box.checked = false;
+      box.dispatchEvent(new Event("change"));
+    }
+
+    /**
+     * The text of the user's message that starts the last turn of a request,
+     * which comes with the context
+     */
+    function turnText(provider: string, body?: ServiceRequestBody): string {
+      const texts =
+        provider === "openai"
+          ? (body?.input ?? []).map((item) => item.content)
+          : (body?.messages ?? []).map((message) => message.content[0]?.text);
+      return (
+        texts
+          .filter((text): text is string => typeof text === "string")
+          .findLast((text) => text.includes("[End of the context]")) ?? ""
+      );
+    }
+
+    it.each(["openai", "anthropic"])(
+      "tells %s the skills that are on with each turn, and how to use them",
+      async (provider) => {
+        const panel = await openPanel(undefined, undefined, { provider });
+        await panel.pasteKey(provider === "openai" ? openAiKey : anthropicKey);
+        await panel.say("Hello");
+        expect(turnText(provider, services.requests[0]?.body)).toContain(
+          "# Skills\nNo skills are on.",
+        );
+
+        await addSkills(panel.container, {
+          "lab-colors/SKILL.md": labColors,
+          "hello/SKILL.md": hello,
+        });
+        // a skill that is off is not listed
+        turnOff(panel.container, "hello");
+        await panel.say("Color the cell types.");
+        const body = services.requests.at(-1)?.body;
+        const turn = turnText(provider, body);
+        expect(turn).toContain(
+          "# Skills\nThe skills that are on; load one with load_skill when a request matches its description:\n" +
+            "- lab-colors: The color conventions of our lab. Use when coloring cell types or clusters.",
+        );
+        expect(turn).not.toContain("- hello");
+        // before the app state, whose JSON goes on to the end of the context
+        expect(turn.indexOf("# Skills")).toBeLessThan(
+          turn.indexOf("# The current app state, as JSON"),
+        );
+        const fixed =
+          provider === "openai" ? body?.instructions : body?.system?.[0]?.text;
+        expect(fixed).toContain(
+          "When a request matches the description of a skill, call\nload_skill",
+        );
+        const names = body?.tools.map((tool) =>
+          String(
+            (tool.function as { name?: string } | undefined)?.name ?? tool.name,
+          ),
+        );
+        expect(names).toEqual(
+          expect.arrayContaining(["load_skill", "read_skill_file"]),
+        );
+        expect(panel.summary.textContent).toContain("· key ✓ · 1 skill");
+      },
+    );
+
+    it("loads a skill and reads its files when the model asks, also a skill named by another", async () => {
+      const panel = await panelWithSkills();
+      services.answers = [
+        { toolCalls: [["load_skill", { name: "lab-colors" }]] },
+        {
+          toolCalls: [
+            [
+              "read_skill_file",
+              { skill: "lab-colors", path: "./references/palette.md" },
+            ],
+          ],
+        },
+        { toolCalls: [["load_skill", { name: "Hello" }]] },
+        { content: "Done." },
+      ];
+      await panel.say("Color the cell types like we do in the lab.");
+      expect(panel.texts("Tool")).toEqual([
+        'load_skill(name: lab-colors)\n→ Done: loaded the skill "lab-colors". Follow its instructions:\n\n' +
+          "Color T cells blue and B cells orange, as in references/palette.md.\n" +
+          "For the other cell types, also use the skill hello.\n\n" +
+          "Its other files, for read_skill_file: references/palette.md (15 B).",
+        'read_skill_file(skill: lab-colors, path: ./references/palette.md)\n→ Done: "references/palette.md" of the skill "lab-colors":\n\nT cell: #0000ff',
+        'load_skill(name: Hello)\n→ Done: loaded the skill "hello". Follow its instructions:\n\nSay ciao.\n\nIt has no other files.',
+      ]);
+      // the results go back to the model
+      expect(JSON.stringify(services.requests.at(-1)?.body.messages)).toContain(
+        "T cell: #0000ff",
+      );
+    });
+
+    it("says which skills and files there are when the model asks for others", async () => {
+      const panel = await panelWithSkills();
+      turnOff(panel.container, "hello");
+      services.answers = [
+        {
+          toolCalls: [
+            ["load_skill", { name: "hello" }],
+            ["read_skill_file", { skill: "lab-colors", path: "colors.md" }],
+            ["read_skill_file", { skill: "lab-colors", path: "SKILL.md" }],
+          ],
+        },
+        { content: "Done." },
+      ];
+      await panel.say("Hello");
+      const [offSkill, missingFile, skillMd] = panel.texts("Tool");
+      expect(offSkill).toContain(
+        'Error: no skill named "hello" is on. The skills that are on: lab-colors.',
+      );
+      expect(missingFile).toContain(
+        'Error: the skill "lab-colors" has no file "colors.md". Its files: references/palette.md.',
+      );
+      expect(skillMd).toContain("name: lab-colors");
+    });
+
+    it("offers no skills to Ollama", async () => {
+      const panel = await openPanel();
+      await addSkills(panel.container, { "hello/SKILL.md": hello });
+      modelCalls(["load_skill", { name: "hello" }]);
+      await panel.say("Hello");
+      const request = ollama.requests[0];
+      expect(JSON.stringify(request?.tools)).not.toContain("load_skill");
+      expect(request?.messages[0]?.content).not.toContain("# Skills");
+      expect(panel.texts("Tool")[0]).toContain(
+        'Error: there is no tool called "load_skill".',
+      );
+    });
+  });
 });

@@ -33,6 +33,11 @@ import {
   loadStoredSkills,
   storeSkill,
 } from "./skill-storage";
+import {
+  describeSkills,
+  skillInstructions,
+  skillToolDefinitions,
+} from "./skill-tools";
 import { buildContext, exampleRequests, stateJson } from "./summary";
 import {
   describeMatrix,
@@ -43,7 +48,7 @@ import {
   maxRowsToRead,
   objectTables,
 } from "./tables";
-import { toolDefinitions, tools } from "./tools";
+import { toolDefinitions, tools, wholeAppTools } from "./tools";
 import type {
   Change,
   ColumnInfo,
@@ -1141,21 +1146,23 @@ export function mountAiChat(
    */
   function instructionsFor(provider: Provider): string {
     return provider.wholeApp
-      ? `${instructions.replace(toolLimits, actionLimits)}\n\n${wholeAppInstructions}`
+      ? `${instructions.replace(toolLimits, actionLimits)}\n\n${wholeAppInstructions}\n\n${skillInstructions}`
       : instructions;
   }
 
-  /** The tools for a service: for the strong models, also call_action */
+  /** The tools for a service: for the strong models, also call_action and the skills */
   function toolsFor(provider: Provider) {
     return [
       ...toolDefinitions,
-      ...(provider.wholeApp ? [callActionDefinition] : []),
+      ...(provider.wholeApp
+        ? [callActionDefinition, ...skillToolDefinitions]
+        : []),
     ].map((definition) => definition.function);
   }
 
   /**
-   * The context as it is now: for the strong models, with the app state as
-   * JSON after the summary
+   * The context as it is now: for the strong models, with the skills that
+   * are on and the app state as JSON after the summary
    */
   function contextFor(provider: Provider): string {
     const summary = buildContext(
@@ -1167,8 +1174,9 @@ export function mountAiChat(
     if (!provider.wholeApp) {
       return summary;
     }
+    const skills = describeSkills(skillList.activeSkills());
     const state = stateJson(projectStore.getState(), appStore.getState());
-    return `${summary}\n\n# The current app state, as JSON\n${state}`;
+    return `${summary}\n\n${skills}\n\n# The current app state, as JSON\n${state}`;
   }
 
   /**
@@ -1262,7 +1270,7 @@ export function mountAiChat(
     args: ToolArguments,
     changes: Change[],
   ): Promise<{ result: string; warning: string }> {
-    const offered = name !== "call_action" || provider.wholeApp;
+    const offered = !wholeAppTools.includes(name) || provider.wholeApp;
     const tool =
       Object.hasOwn(tools, name) && offered ? tools[name] : undefined;
     if (tool === undefined) {
@@ -1276,7 +1284,14 @@ export function mountAiChat(
     try {
       result = await tool(
         args,
-        { projectStore, dataStore, appStore, tables, changes },
+        {
+          projectStore,
+          dataStore,
+          appStore,
+          tables,
+          changes,
+          skills: skillList.activeSkills(),
+        },
         { signal },
       );
     } catch (error) {

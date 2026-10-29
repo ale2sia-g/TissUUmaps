@@ -135,6 +135,21 @@ In the settings (⚙), _Add skill…_ adds the skills of a folder: choose the fo
 
 A skill must follow the rules of the format: its name is lowercase, with only letters, digits and hyphens, and is also the name of its folder, and it has a description. Fields of `SKILL.md` that are not part of the format, such as those of other agents, are ignored, and the list says so.
 
+With OpenAI and Anthropic, each request tells the model the names and descriptions of the skills that are on. When a request matches the description of a skill, the model loads its instructions (a line _📘 load_skill_ in the chat) and follows them with its tools; it reads the other files of the skill, such as references, only when the instructions point to them (_📄 read_skill_file_). The instructions of a skill may also tell it to use another skill. So the description says what the skill is for and when to use it, and the instructions say how. Scripts of skills cannot run yet. Ollama's models do not use skills.
+
+A skill with only instructions can already do a lot with the tools of the chat, for example the color conventions of a lab:
+
+```markdown
+---
+name: lab-colors
+description: The color conventions of our lab for cell types and clusters. Use when the user asks to color cells "with our colors".
+---
+
+Color the cell types with set_group_colors: T cells blue, B cells orange,
+macrophages green, all others light grey. If there is no column of cell
+types, color the clusters with the palette batlowS.
+```
+
 ## Limitations
 
 - **Gene names**: genes can be named, as in `X[EPCAM]`, only if TissUUmaps could read the gene names from the index of `var/` of an AnnData table. Otherwise, the genes only have numbers (`X[0]`, `X[1]`, ...), and the project summary says that the gene names are not available.
@@ -175,6 +190,8 @@ The result of an action lists exactly what changed, with the value before and af
 The names, tones and avatars of Dia and Aid, and the words shown while the model thinks, are in `persona.ts`, next to the plugin. The panel uses TissUUmaps' theme colors (CSS variables such as `--foreground` and `--muted`), so that it stays readable with the light and the dark theme.
 
 `SKILL.md` is read and checked in `skills.ts` like the reference validator of the format, [skills-ref](https://github.com/agentskills/agentskills/tree/main/skills-ref), does, except that unknown fields are ignored with a warning. Only the part of YAML that the frontmatter of skills uses is read, so that the plugin needs no YAML library. The skills added with _Remember this skill_ are kept in the browser's IndexedDB, in the database `tissuumaps.ai-chat`, as files rather than as read skills, so that they are read again with the rules of the plugin that opens them.
+
+The model sees the skills progressively, as the format intends: the names and descriptions of the skills that are on go with the context of each turn, between the project summary and the app state; the instructions of a skill come back as the result of the tool `load_skill(name)`, and its other files as the result of `read_skill_file(skill, path)` (text only, at most 50,000 characters). Both tools, and the rules for using skills, are always part of the tools and the fixed instructions of OpenAI and Anthropic, also without skills, so that the beginning of the requests stays the same for the prompt cache. They are in `skill-tools.ts`.
 
 ---
 

@@ -13,6 +13,7 @@ import {
   showOnly,
 } from "./object-tools";
 import { itemsKinds, objectKinds } from "./objects";
+import { loadSkill, readSkillFile } from "./skill-tools";
 import type { Tool } from "./types";
 
 /** The ids parameter that most tools share */
@@ -274,6 +275,11 @@ export const tools: Record<string, Tool> = {
   set_color: setColor,
   show_only_groups: showOnlyGroups,
   show_all_groups: showAllGroups,
-  // only offered to OpenAI and Anthropic, see runTool
+  // only offered to OpenAI and Anthropic, see wholeAppTools
   call_action: callAction,
+  load_skill: loadSkill,
+  read_skill_file: readSkillFile,
 };
+
+/** The tools only offered to OpenAI and Anthropic, which know the whole app */
+export const wholeAppTools = ["call_action", "load_skill", "read_skill_file"];

@@ -197,6 +197,8 @@ export const toolIcons: Record<string, string> = {
   show_only_groups: "🔍",
   show_all_groups: "🔍",
   call_action: "⚙️",
+  load_skill: "📘",
+  read_skill_file: "📄",
 };
 
 /**

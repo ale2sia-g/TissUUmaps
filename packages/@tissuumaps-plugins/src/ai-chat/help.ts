@@ -108,6 +108,17 @@ export const helpText = `How to use this chat
    tone changes, at once when you switch the theme: what the assistant can do,
    and its rules (such as telling the truth about what it changed), stay the same.
 
+11. Skills
+   A skill gives the assistant instructions for a task, e.g. the color
+   conventions of your lab. It is a folder with a SKILL.md file: its name and a
+   description of when to use it, then the instructions (see
+   https://agentskills.io). Add skills in the settings (⚙, "Add skill…"):
+   choose the folder of one skill, or a folder of skills. With "Remember this
+   skill", this browser keeps it for every project. Each skill can be turned off
+   and on, and removed. With OpenAI and Anthropic, the assistant sees the names
+   and descriptions of the skills that are on, and reads a skill's instructions
+   only when a request needs them. Ollama's models do not use skills.
+
 What the assistant can do: answer questions about the open project, show or hide
 images, labels, points and shapes, make them more or less transparent, make
 points bigger or smaller, color labels and points by a column of their table
