@@ -122,6 +122,12 @@ export const helpText = `How to use this chat
    With OpenAI and Anthropic, the assistant sees the names
    and descriptions of the skills that are on, and reads a skill's instructions
    only when a request needs them. Ollama's models do not use skills.
+   A skill can also bring JavaScript scripts, e.g. to compute on the data. Their
+   code is always shown in the chat before they run. They run in a sandbox:
+   they can read the data, but cannot change the project, use the internet or
+   see your API key. "Stop" stops a script, and after two minutes it stops by
+   itself. Before the scripts of a skill that came with the project run for the
+   first time, you are asked.
 
 What the assistant can do: answer questions about the open project, show or hide
 images, labels, points and shapes, make them more or less transparent, make

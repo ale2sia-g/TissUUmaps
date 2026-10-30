@@ -71,8 +71,25 @@ export type ToolContext = {
   tables: TableKnowledge;
   /** The changes of the current request, which the tool adds to */
   changes: Change[];
-  /** The skills that are on, for load_skill and read_skill_file */
+  /** The skills that are on, for load_skill, read_skill_file and run_script */
   skills: Skill[];
+  /**
+   * Shows the progress of a long tool in a row of the chat, with a button
+   * that stops it (through the abort signal of the tool)
+   */
+  progress: (text: string) => void;
+  /**
+   * Runs a script of a skill in the sandbox, after asking the user for the
+   * scripts of a skill of the project, and shows its code in the chat
+   *
+   * @returns The result for the model
+   */
+  runSkillScript: (
+    skill: Skill,
+    path: string,
+    args: unknown,
+    options?: { signal?: AbortSignal; progress?: (text: string) => void },
+  ) => Promise<string>;
 };
 
 /**

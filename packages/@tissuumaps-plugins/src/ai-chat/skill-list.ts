@@ -33,6 +33,13 @@ export type SkillList = {
    * not be read
    */
   setProjectSkills: (project: ProjectSkills | Error | null) => void;
+  /**
+   * Where a skill of the open project comes from
+   *
+   * @param skill - The skill
+   * @returns e.g. "/xenium/skills", or `undefined` for a skill added by hand
+   */
+  projectSourceOf: (skill: Skill) => string | undefined;
 };
 
 /** The look of the checkboxes */
@@ -542,5 +549,9 @@ export function makeSkillList(
         .sort((a, b) => a.name.localeCompare(b.name));
     },
     setProjectSkills,
+    projectSourceOf: (skill) =>
+      projectEntries.some((entry) => entry.skill === skill)
+        ? projectWhere
+        : undefined,
   };
 }

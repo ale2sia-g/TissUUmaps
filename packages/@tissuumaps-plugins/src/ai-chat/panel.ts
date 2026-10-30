@@ -27,6 +27,7 @@ import {
   providers,
   readJsonLines,
 } from "./providers";
+import { type ScriptQuestion, runScript } from "./sandbox";
 import { loadSetting, saveSetting } from "./settings";
 import { makeSkillList } from "./skill-list";
 import {
@@ -39,6 +40,7 @@ import {
   skillInstructions,
   skillToolDefinitions,
 } from "./skill-tools";
+import type { Skill } from "./skills";
 import { buildContext, exampleRequests, stateJson } from "./summary";
 import {
   describeMatrix,
@@ -46,6 +48,7 @@ import {
   findUsedColumns,
   linkedTables,
   listColumns,
+  matrixColumns,
   maxRowsToRead,
   objectTables,
 } from "./tables";
@@ -79,6 +82,12 @@ import { currentValue, describeValueChange, handNote, takeBack } from "./undo";
 
 /** How many times in a row the model may call tools before it is stopped */
 const maxSteps = 5;
+
+/** The longest time a script of a skill may run, in milliseconds */
+const scriptTimeLimit = 120_000;
+
+/** The longest result of a script that the model gets, in characters */
+const maxScriptText = 20_000;
 
 /**
  * Mounts the chat panel
@@ -263,6 +272,8 @@ export function mountAiChat(
     updateLayout,
     { signal },
   );
+  /** The skills of the project whose scripts the user allowed, by project and name */
+  const allowedScripts = new Set<string>();
   /** The project and workspace whose skills were read last */
   let skillsRead: { instanceId: string; workspace: unknown } | null = null;
 
@@ -1294,8 +1305,176 @@ export function mountAiChat(
   }
 
   /**
+   * Answers a question of a script in the sandbox, always with copies, so
+   * that the script cannot change the data of the project
+   *
+   * @param question - What the script asks for, through tm
+   * @param skill - The skill of the script, for tm.readFile
+   * @param options - Optional abort signal
+   * @returns The answer
+   * @throws If the question cannot be answered, e.g. an unknown table
+   */
+  async function answerScript(
+    question: ScriptQuestion,
+    skill: Skill,
+    options?: { signal?: AbortSignal },
+  ): Promise<unknown> {
+    const { signal: stop } = options ?? {};
+    stop?.throwIfAborted();
+    if (question.kind === "tables") {
+      return projectStore
+        .getState()
+        .tables.map(({ id, name }) => ({ id, name }));
+    }
+    if (question.kind === "file") {
+      const file = skill.files.get(question.path);
+      if (file === undefined) {
+        throw new Error(`the skill has no file "${question.path}"`);
+      }
+      return file.text();
+    }
+    const table = projectStore
+      .getState()
+      .tables.find(
+        ({ id, name }) => id === question.table || name === question.table,
+      );
+    const tableRef =
+      table === undefined
+        ? undefined
+        : dataStore.getState().tableDataRefs.get(table.id);
+    if (table === undefined || tableRef === undefined) {
+      throw new Error(
+        `there is no loaded table "${question.table}"; tm.tables() lists the tables`,
+      );
+    }
+    const data = await tableRef.promise;
+    stop?.throwIfAborted();
+    if (question.kind === "columns") {
+      if (question.matrix !== undefined) {
+        return matrixColumns(data, question.matrix, { signal: stop });
+      }
+      return (await listColumns(data, { signal: stop })).map(
+        ({ name, matrix }) => ({ name, matrix }),
+      );
+    }
+    const rows = data.getSize();
+    if (rows > maxRowsToRead) {
+      throw new Error(
+        `the table "${table.name}" has ${rows} rows, too many to read here (at most ${maxRowsToRead})`,
+      );
+    }
+    const values = await data.loadValues(question.column, { signal: stop });
+    // a copy of these values only, not of a buffer they may share
+    return values.slice();
+  }
+
+  /**
+   * Shows the code of a script in the chat, always open, before it runs
+   *
+   * @param skill - The skill of the script
+   * @param path - The path of the script in the skill
+   * @param code - The code
+   */
+  function showScript(skill: Skill, path: string, code: string): void {
+    const body = addFrame("Script", "tool");
+    const title = document.createElement("div");
+    title.textContent = `🧪 ${skill.name}: ${path} (JavaScript)`;
+    const pre = document.createElement("pre");
+    pre.textContent = code;
+    pre.style.cssText =
+      "margin: 4px 0 0; max-height: 240px; overflow: auto; white-space: pre;" +
+      "font-family: monospace; font-size: 12px;";
+    body.append(title, pre);
+  }
+
+  /**
+   * Runs a script of a skill in the sandbox: shows its code, asks the user
+   * the first time for a skill that came with the project, and shows how
+   * long it has been running
+   *
+   * @param skill - The skill
+   * @param path - The path of the script in the skill
+   * @param args - What the script gets as tm.args
+   * @param options - Optional abort signal, which stops the script, and
+   * where to show the progress
+   * @returns The result for the model
+   * @throws If the script takes too long, or is stopped
+   */
+  async function runSkillScript(
+    skill: Skill,
+    path: string,
+    args: unknown,
+    options?: { signal?: AbortSignal; progress?: (text: string) => void },
+  ): Promise<string> {
+    const { signal: stop, progress } = options ?? {};
+    stop?.throwIfAborted();
+    const code = (await skill.files.get(path)?.text()) ?? "";
+    stop?.throwIfAborted();
+    showScript(skill, path, code);
+    const from = skillList.projectSourceOf(skill);
+    const key = `${projectStore.getState().instanceId}:${skill.name}`;
+    if (from !== undefined && !allowedScripts.has(key)) {
+      // time to show the code before the question, which blocks the page
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const allowed = window.confirm(
+        `The skill "${skill.name}" came with the open project (from ${from}). Run its script ${path}?\n\n` +
+          "Its code is shown in the chat. Scripts run in a sandbox: they can read the data of the project, " +
+          "but cannot change it, use the network or see your API key. You are asked once for each skill of the project.",
+      );
+      if (!allowed) {
+        return `Error: the user did not allow the scripts of the skill "${skill.name}", which came with the project. Tell the user, and do not run them again unless they ask.`;
+      }
+      allowedScripts.add(key);
+    }
+    const started = Date.now();
+    let reported = "";
+    const update = () =>
+      progress?.(
+        `running ${path}, ${Math.round((Date.now() - started) / 1000)} s${reported === "" ? "" : `: ${reported}`}`,
+      );
+    update();
+    const ticker = setInterval(update, 1000);
+    try {
+      const outcome = await runScript(
+        {
+          code,
+          args,
+          project: JSON.parse(
+            stateJson(projectStore.getState(), appStore.getState()),
+          ) as unknown,
+        },
+        (question) => answerScript(question, skill, { signal: stop }),
+        {
+          timeLimit: scriptTimeLimit,
+          signal: stop,
+          onProgress: (text) => {
+            reported = text;
+            update();
+          },
+        },
+      );
+      const seconds = ((Date.now() - started) / 1000).toFixed(1);
+      const logs =
+        outcome.logs.length > 0 ? `\n\nLog:\n${outcome.logs.join("\n")}` : "";
+      const text =
+        outcome.error !== undefined
+          ? `Error: ${path} of the skill "${skill.name}" failed: ${outcome.error}${logs}`
+          : `Done: ran ${path} of the skill "${skill.name}" in ${seconds} s.\n\nResult:\n${outcome.result || "(nothing)"}${logs}`;
+      return text.length > maxScriptText
+        ? `${text.slice(0, maxScriptText)}\n\n(Cut: only the first ${maxScriptText} of ${text.length} characters.)`
+        : text;
+    } finally {
+      clearInterval(ticker);
+    }
+  }
+
+  /**
    * Runs one tool call of the model
    *
+   * A long tool shows its progress in a row of the chat, with a button that
+   * stops it.
+   *
+   * @param shownCall - The call as the Tool row shows it
    * @returns The result for the model, and a warning for the user if another
    * visible object can cover the change
    */
@@ -1304,6 +1483,7 @@ export function mountAiChat(
     name: string,
     args: ToolArguments,
     changes: Change[],
+    shownCall: string,
   ): Promise<{ result: string; warning: string }> {
     const offered = !wholeAppTools.includes(name) || provider.wholeApp;
     const tool =
@@ -1315,6 +1495,26 @@ export function mountAiChat(
       };
     }
     const changesBefore = changes.length;
+    // stopped by its Stop button, or when the panel closes
+    const stopper = new AbortController();
+    const stopWithPanel = () => stopper.abort();
+    signal.addEventListener("abort", stopWithPanel, { once: true });
+    let progressRow: { frame: HTMLElement; line: HTMLElement } | null = null;
+    const progress = (text: string) => {
+      if (progressRow === null) {
+        const body = addFrame("Tool", "tool");
+        const line = document.createElement("div");
+        const stopButton = makeButton(
+          "Stop",
+          () => stopper.abort(),
+          `${smallButtonStyle}margin-top: 4px;`,
+        );
+        stopButton.title = "Stop this tool";
+        body.append(line, stopButton);
+        progressRow = { frame: body.parentElement ?? body, line };
+      }
+      progressRow.line.textContent = `${shownCall}\n… ${text}`;
+    };
     let result: string;
     try {
       result = await tool(
@@ -1326,12 +1526,19 @@ export function mountAiChat(
           tables,
           changes,
           skills: skillList.activeSkills(),
+          progress,
+          runSkillScript,
         },
-        { signal },
+        { signal: stopper.signal },
       );
     } catch (error) {
       signal.throwIfAborted();
-      result = `Error: ${error instanceof Error ? error.message : String(error)}`;
+      result = stopper.signal.aborted
+        ? "Stopped by the user before the end. Tell the user, and do not run it again unless they ask."
+        : `Error: ${error instanceof Error ? error.message : String(error)}`;
+    } finally {
+      signal.removeEventListener("abort", stopWithPanel);
+      (progressRow as { frame: HTMLElement } | null)?.frame.remove();
     }
     const newChanges = changes.slice(changesBefore);
     rereadTables(newChanges);
@@ -1450,7 +1657,7 @@ export function mountAiChat(
           if (failedCalls.includes(callText)) {
             repeated = true;
           } else {
-            outcome = await runTool(provider, name, args, changes);
+            outcome = await runTool(provider, name, args, changes, shownCall);
           }
           if (outcome.result.startsWith("Error")) {
             failedCalls.push(callText);

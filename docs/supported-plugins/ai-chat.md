@@ -143,7 +143,7 @@ In the list, the skills of the project are marked _project_ and those added by h
 
 A skill must follow the rules of the format: its name is lowercase, with only letters, digits and hyphens, and is also the name of its folder, and it has a description. Fields of `SKILL.md` that are not part of the format, such as those of other agents, are ignored, and the list says so.
 
-With OpenAI and Anthropic, each request tells the model the names and descriptions of the skills that are on. When a request matches the description of a skill, the model loads its instructions (a line _📘 load_skill_ in the chat) and follows them with its tools; it reads the other files of the skill, such as references, only when the instructions point to them (_📄 read_skill_file_). The instructions of a skill may also tell it to use another skill. So the description says what the skill is for and when to use it, and the instructions say how. Scripts of skills cannot run yet. Ollama's models do not use skills.
+With OpenAI and Anthropic, each request tells the model the names and descriptions of the skills that are on. When a request matches the description of a skill, the model loads its instructions (a line _📘 load_skill_ in the chat) and follows them with its tools; it reads the other files of the skill, such as references, only when the instructions point to them (_📄 read_skill_file_). The instructions of a skill may also tell it to use another skill. So the description says what the skill is for and when to use it, and the instructions say how. Ollama's models do not use skills.
 
 A skill with only instructions can already do a lot with the tools of the chat, for example the color conventions of a lab:
 
@@ -157,6 +157,40 @@ Color the cell types with set_group_colors: T cells blue, B cells orange,
 macrophages green, all others light grey. If there is no column of cell
 types, color the clusters with the palette batlowS.
 ```
+
+### Scripts
+
+A skill can also bring JavaScript scripts, for what the tools of the chat cannot do, such as computing on the data. Its instructions say when to run which script, and with which arguments; the model runs it with _🧪 run_script_. The code of every script is shown in the chat before it runs, always open. While a script runs, a row shows for how long, and its _Stop_ button stops it; a script that runs longer than two minutes is stopped.
+
+A script is a JavaScript module whose default export is a function. It gets an object `tm`, and what it returns goes to the model, as text (objects and lists as JSON); what it logs with `console.log` goes along with it:
+
+```js
+// scripts/cluster-sizes.js: the rows of each group of a column
+export default async function (tm) {
+  const { table, column } = tm.args;
+  const values = await tm.read(table, column);
+  const counts = {};
+  for (const value of values) {
+    counts[value] = (counts[value] ?? 0) + 1;
+  }
+  return counts;
+}
+```
+
+| `tm`                           | What it gives                                                                              |
+| ------------------------------ | ------------------------------------------------------------------------------------------ |
+| `tm.args`                      | the arguments the model gave, as the instructions of the skill describe them               |
+| `tm.project`                   | a copy of the state of the project, the same JSON the model gets                           |
+| `await tm.tables()`            | the tables of the project, with their `id` and `name`                                      |
+| `await tm.columns(table)`      | the columns of a table, with `matrix: true` for matrices such as `X`                       |
+| `await tm.columns(table, "X")` | the columns of a matrix, e.g. `X[EPCAM]`                                                   |
+| `await tm.read(table, column)` | the values of a column, e.g. `obs/leiden` or `X[EPCAM]` (tables of at most 5 million rows) |
+| `await tm.readFile(path)`      | the text of another file of the skill                                                      |
+| `tm.progress(text)`            | shows how far the script is, next to the _Stop_ button                                     |
+
+Scripts run in a sandbox, which keeps them away from everything else: they can read the data through `tm`, but get only copies, so they cannot change the project; they cannot use the network, load other code, use `eval`, or reach the page, its storage or the API key. To change what is shown, the model uses its tools with what the script returned. Python scripts cannot run yet.
+
+The scripts of a skill that came with the project run only if you allow it: the first time one of them would run, the panel asks, and the code is already shown in the chat. Skills added by hand are yours, so their scripts run without asking.
 
 ## Limitations
 
@@ -202,6 +236,8 @@ The names, tones and avatars of Dia and Aid, and the words shown while the model
 The model sees the skills progressively, as the format intends: the names and descriptions of the skills that are on go with the context of each turn, between the project summary and the app state; the instructions of a skill come back as the result of the tool `load_skill(name)`, and its other files as the result of `read_skill_file(skill, path)` (text only, at most 50,000 characters). Both tools, and the rules for using skills, are always part of the tools and the fixed instructions of OpenAI and Anthropic, also without skills, so that the beginning of the requests stays the same for the prompt cache. They are in `skill-tools.ts`.
 
 The skills of the project are read in `project-skills.ts`, again whenever another project is opened or another folder is connected. The folder `skills` is found with `SourceUtils.normalizeSource("skills", workspace, source)`, like a project-relative data source: in the workspace, its files are listed (hidden ones left out, at most 1000); for a project opened from a URL, the files listed in `skills/index.json` are downloaded, and paths that leave the `skills` folder are refused. Without a `skills` folder or a `skills/index.json`, the project simply has no skills.
+
+Scripts run in `sandbox.ts`: each run gets a new iframe with `sandbox="allow-scripts"`, so that its origin is opaque and it cannot reach the page or its storage, and with the Content Security Policy `default-src 'none'; script-src 'unsafe-inline' blob:; worker-src blob:`, so that it has no network, no code from elsewhere and no `eval`. In it, a Web Worker, which inherits the policy, imports the script from a `blob:` URL and calls its default export. The worker keeps the page responsive, and removing the iframe stops it at any time: when the script ends, fails, takes longer than the time limit, or is stopped. The questions of `tm` travel to the panel through a `MessageChannel`, and the panel answers them with copies. The code of the worker and of the page of the sandbox are functions of `sandbox.ts`, sent as text, so they use nothing from outside themselves. The tests check the parts around the sandbox; what it blocks is checked in a browser with a script that tries to get out in about twenty ways (network, other code, storage, the page), all of which must fail.
 
 ---
 

@@ -199,6 +199,7 @@ export const toolIcons: Record<string, string> = {
   call_action: "⚙️",
   load_skill: "📘",
   read_skill_file: "📄",
+  run_script: "🧪",
 };
 
 /**

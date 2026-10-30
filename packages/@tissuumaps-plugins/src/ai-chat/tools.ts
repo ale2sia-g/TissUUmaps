@@ -13,7 +13,7 @@ import {
   showOnly,
 } from "./object-tools";
 import { itemsKinds, objectKinds } from "./objects";
-import { loadSkill, readSkillFile } from "./skill-tools";
+import { loadSkill, readSkillFile, runScriptTool } from "./skill-tools";
 import type { Tool } from "./types";
 
 /** The ids parameter that most tools share */
@@ -279,7 +279,13 @@ export const tools: Record<string, Tool> = {
   call_action: callAction,
   load_skill: loadSkill,
   read_skill_file: readSkillFile,
+  run_script: runScriptTool,
 };
 
 /** The tools only offered to OpenAI and Anthropic, which know the whole app */
-export const wholeAppTools = ["call_action", "load_skill", "read_skill_file"];
+export const wholeAppTools = [
+  "call_action",
+  "load_skill",
+  "read_skill_file",
+  "run_script",
+];

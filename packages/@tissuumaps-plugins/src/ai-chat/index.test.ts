@@ -26,7 +26,59 @@ import {
 
 import { aiChatPlugin } from ".";
 import { thinkingWords } from "./persona";
+import type { ScriptQuestion, ScriptRun } from "./sandbox";
 import { storeTypes } from "./store-types.generated";
+
+/**
+ * The fake sandbox: jsdom has no Web Workers, and what the real one blocks
+ * is checked in a browser. It asks the panel what a script would ask, and
+ * gives back a chosen outcome.
+ */
+const sandbox = vi.hoisted(() => {
+  const state: {
+    /** The scripts that ran, with the answers of the panel */
+    runs: (ScriptRun & { answers: unknown[] })[];
+    /** "done", an error the sandbox throws, or "hang" until stopped */
+    behavior: "done" | "hang" | Error;
+  } = { runs: [], behavior: "done" };
+  return state;
+});
+vi.mock("./sandbox", () => ({
+  runScript: async (
+    run: ScriptRun,
+    answer: (question: ScriptQuestion) => Promise<unknown>,
+    options: { signal?: AbortSignal; onProgress?: (text: string) => void },
+  ) => {
+    const answers = [
+      await answer({ kind: "tables" }),
+      await answer({ kind: "columns", table: "table" }),
+      await answer({
+        kind: "values",
+        table: "tables/table",
+        column: "obs/leiden",
+      }),
+      await answer({ kind: "values", table: "nope", column: "x" }).catch(
+        (error: Error) => error.message,
+      ),
+    ];
+    sandbox.runs.push({ ...run, answers });
+    options.onProgress?.("half way");
+    if (sandbox.behavior === "hang") {
+      await new Promise((_resolve, reject) =>
+        options.signal?.addEventListener("abort", () =>
+          reject(options.signal?.reason as Error),
+        ),
+      );
+    }
+    if (sandbox.behavior instanceof Error) {
+      throw sandbox.behavior;
+    }
+    return {
+      result: `${(answers[0] as unknown[]).length} tables`,
+      logs: ["hello from the script"],
+    };
+  },
+}));
 
 /** The ids of the objects of the fake project */
 const cellLabels = "labels/cell_labels@global";
@@ -3084,59 +3136,236 @@ describe("aiChatPlugin", () => {
       expect(skillMd).toContain("name: lab-colors");
     });
 
-    it("uses the skills next to the project file in the connected folder", async () => {
-      /** A folder of the connected folder, as the File System API gives it */
-      const folder = (name: string, entries: { name: string }[]) => ({
-        kind: "directory",
-        name,
-        getDirectoryHandle: (entryName: string) => {
-          const entry = entries.find((e) => e.name === entryName);
-          return entry && "values" in entry
-            ? Promise.resolve(entry)
-            : Promise.reject(new DOMException(entryName, "NotFoundError"));
-        },
-        getFileHandle: (entryName: string) =>
-          Promise.reject(
-            new DOMException(
-              entryName,
-              entries.some((e) => e.name === entryName)
-                ? "TypeMismatchError"
-                : "NotFoundError",
-            ),
+    /** A folder of the connected folder, as the File System API gives it */
+    const folder = (name: string, entries: { name: string }[]) => ({
+      kind: "directory",
+      name,
+      getDirectoryHandle: (entryName: string) => {
+        const entry = entries.find((e) => e.name === entryName);
+        return entry && "values" in entry
+          ? Promise.resolve(entry)
+          : Promise.reject(new DOMException(entryName, "NotFoundError"));
+      },
+      getFileHandle: (entryName: string) =>
+        Promise.reject(
+          new DOMException(
+            entryName,
+            entries.some((e) => e.name === entryName)
+              ? "TypeMismatchError"
+              : "NotFoundError",
           ),
-        async *values() {
-          yield* await Promise.resolve(entries);
-        },
-      });
-      const file = (name: string, text: string) => ({
-        kind: "file",
-        name,
-        getFile: () => Promise.resolve(new File([text], name)),
-      });
-      const panel = await openPanel(undefined, undefined, {
-        provider: "anthropic",
-      });
-      await panel.pasteKey(anthropicKey);
+        ),
+      async *values() {
+        yield* await Promise.resolve(entries);
+      },
+    });
+    /** A file of the connected folder */
+    const file = (name: string, text: string) => ({
+      kind: "file",
+      name,
+      getFile: () => Promise.resolve(new File([text], name)),
+    });
+
+    /** Opens the project /xenium/project.json, with these skill folders */
+    async function openProjectWith(
+      panel: Awaited<ReturnType<typeof openPanel>>,
+      skills: ReturnType<typeof folder>[],
+      expected: string,
+    ): Promise<void> {
       panel.appStore.setState({
         workspace: folder("root", [
           folder("xenium", [
             file("project.json", "{}"),
-            folder("skills", [
-              folder("lab-colors", [file("SKILL.md", labColors)]),
-            ]),
+            folder("skills", skills),
           ]),
         ]) as unknown as FileSystemDirectoryHandle,
       });
       panel.projectStore.openOtherProject({ source: "/xenium/project.json" });
       await vi.waitFor(() =>
-        expect(panel.container.textContent).toContain(
-          "From the project: lab-colors.",
-        ),
+        expect(panel.container.textContent).toContain(expected),
+      );
+    }
+
+    const countScript =
+      "export default async function (tm) {\n  return (await tm.tables()).length;\n}";
+    const counter = [
+      "---",
+      "name: counter",
+      "description: Counts the tables.",
+      "---",
+      "",
+      "Run scripts/count.js.",
+    ].join("\n");
+
+    beforeEach(() => {
+      sandbox.runs.length = 0;
+      sandbox.behavior = "done";
+    });
+
+    it("uses the skills next to the project file in the connected folder", async () => {
+      const panel = await openPanel(undefined, undefined, {
+        provider: "anthropic",
+      });
+      await panel.pasteKey(anthropicKey);
+      await openProjectWith(
+        panel,
+        [folder("lab-colors", [file("SKILL.md", labColors)])],
+        "From the project: lab-colors.",
       );
       expect(panel.summary.textContent).toContain("· key ✓ · 1 skill");
       await panel.say("Color the cell types.");
       expect(turnText("anthropic", services.requests.at(-1)?.body)).toContain(
         "- lab-colors: The color conventions of our lab.",
+      );
+    });
+
+    it("runs a script of a skill in the sandbox, shows its code, and gives the model what it returned", async () => {
+      const confirm = vi.spyOn(window, "confirm");
+      const panel = await panelWithSkills();
+      await addSkills(panel.container, {
+        "counter/SKILL.md": counter,
+        "counter/scripts/count.js": countScript,
+      });
+      services.answers = [
+        {
+          toolCalls: [
+            [
+              "run_script",
+              {
+                skill: "counter",
+                path: "scripts/count.js",
+                args: { column: "obs/leiden" },
+              },
+            ],
+          ],
+        },
+        { content: "There is 1 table." },
+      ];
+      await panel.say("How many tables are there?");
+      expect(confirm).not.toHaveBeenCalled();
+      expect(panel.texts("Script")).toEqual([
+        `🧪 counter: scripts/count.js (JavaScript)${countScript}`,
+      ]);
+      const [tool] = panel.texts("Tool");
+      expect(tool).toMatch(
+        /^run_script\(skill: counter, path: scripts\/count\.js, args: \{"column":"obs\/leiden"\}\)\n→ Done: ran scripts\/count\.js of the skill "counter" in \d+\.\d s\.\n\nResult:\n1 tables\n\nLog:\nhello from the script$/,
+      );
+      // what the script got, and the answers to its questions
+      const [run] = sandbox.runs;
+      expect(run?.code).toBe(countScript);
+      expect(run?.args).toEqual({ column: "obs/leiden" });
+      expect(run?.project).toMatchObject({
+        projectStore: { name: "xenium" },
+      });
+      const [tables, columns, values, unknown] = run?.answers ?? [];
+      expect(tables).toEqual([{ id: "tables/table", name: "table" }]);
+      expect(columns).toContainEqual({ name: "obs/leiden", matrix: false });
+      expect(columns).toContainEqual({ name: "X", matrix: true });
+      expect((values as unknown[]).length).toBe(2000);
+      expect(unknown).toBe(
+        'there is no loaded table "nope"; tm.tables() lists the tables',
+      );
+    });
+
+    it("asks once before running the scripts of a skill of the project, and runs nothing without permission", async () => {
+      const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+      const panel = await openPanel(undefined, undefined, {
+        provider: "anthropic",
+      });
+      await panel.pasteKey(anthropicKey);
+      await openProjectWith(
+        panel,
+        [
+          folder("counter", [
+            file("SKILL.md", counter),
+            folder("scripts", [file("count.js", countScript)]),
+          ]),
+        ],
+        "From the project: counter.",
+      );
+      const runCount = (): [string, Record<string, unknown>] => [
+        "run_script",
+        { skill: "counter", path: "scripts/count.js" },
+      ];
+      services.answers = [{ toolCalls: [runCount()] }, { content: "No." }];
+      await panel.say("Count the tables.");
+      expect(confirm).toHaveBeenCalledTimes(1);
+      expect(confirm.mock.calls[0]?.[0]).toContain(
+        'The skill "counter" came with the open project (from /xenium/skills). Run its script scripts/count.js?',
+      );
+      // the code is shown also when it does not run
+      expect(panel.texts("Script")).toHaveLength(1);
+      expect(sandbox.runs).toHaveLength(0);
+      expect(panel.texts("Tool")[0]).toContain(
+        'Error: the user did not allow the scripts of the skill "counter", which came with the project.',
+      );
+
+      confirm.mockReturnValue(true);
+      services.answers = [
+        { toolCalls: [runCount()] },
+        { toolCalls: [runCount()] },
+        { content: "Done." },
+      ];
+      await panel.say("Count the tables, I allow it.");
+      expect(confirm).toHaveBeenCalledTimes(2);
+      expect(sandbox.runs).toHaveLength(2);
+    });
+
+    it("stops a script with Stop, and explains scripts that fail or cannot run", async () => {
+      const panel = await panelWithSkills();
+      await addSkills(panel.container, {
+        "counter/SKILL.md": counter,
+        "counter/scripts/count.js": countScript,
+        "counter/scripts/count.py": "print(1)",
+      });
+      sandbox.behavior = "hang";
+      services.answers = [
+        {
+          toolCalls: [
+            ["run_script", { skill: "counter", path: "scripts/count.js" }],
+          ],
+        },
+        { content: "It was stopped." },
+      ];
+      (panel.container.querySelector("textarea") as HTMLTextAreaElement).value =
+        "Count the tables.";
+      panel.button("Send").click();
+      await vi.waitFor(() => expect(panel.button("Stop")).toBeDefined());
+      expect(panel.container.textContent).toContain(
+        "… running scripts/count.js, 0 s: half way",
+      );
+      panel.button("Stop").click();
+      await vi.waitFor(() =>
+        expect(panel.button("Send").textContent).toBe("Send"),
+      );
+      expect(panel.button("Stop")).toBeUndefined();
+      expect(panel.texts("Tool")[0]).toContain(
+        "Stopped by the user before the end.",
+      );
+
+      sandbox.behavior = new Error(
+        "the script took longer than 120 seconds, and was stopped",
+      );
+      services.answers = [
+        {
+          toolCalls: [
+            ["run_script", { skill: "counter", path: "scripts/count.js" }],
+            ["run_script", { skill: "counter", path: "scripts/count.py" }],
+            ["run_script", { skill: "counter", path: "scripts/other.js" }],
+          ],
+        },
+        { content: "Done." },
+      ];
+      await panel.say("Count them again.");
+      const [tooLong, python, missing] = panel.texts("Tool").slice(1);
+      expect(tooLong).toContain(
+        "Error: the script took longer than 120 seconds, and was stopped",
+      );
+      expect(python).toContain(
+        'Error: "scripts/count.py" is a Python script, and only JavaScript scripts can run for now.',
+      );
+      expect(missing).toContain(
+        'Error: the skill "counter" has no file "scripts/other.js". Its scripts: scripts/count.js, scripts/count.py.',
       );
     });
 
@@ -3147,6 +3376,7 @@ describe("aiChatPlugin", () => {
       await panel.say("Hello");
       const request = ollama.requests[0];
       expect(JSON.stringify(request?.tools)).not.toContain("load_skill");
+      expect(JSON.stringify(request?.tools)).not.toContain("run_script");
       expect(request?.messages[0]?.content).not.toContain("# Skills");
       expect(panel.texts("Tool")[0]).toContain(
         'Error: there is no tool called "load_skill".',
