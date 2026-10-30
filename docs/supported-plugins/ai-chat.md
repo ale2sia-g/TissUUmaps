@@ -131,7 +131,15 @@ See also [Ollama's FAQ](https://docs.ollama.com/faq) on `OLLAMA_ORIGINS`.
 
 A skill gives the assistant instructions, and maybe scripts, for a task it cannot do on its own, such as an analysis. Skills use the [Agent Skills](https://agentskills.io/specification) format: a folder with a `SKILL.md` file, which starts with the skill's name and description, followed by its instructions. The folder may hold other files, such as scripts.
 
-In the settings (⚙), _Add skill…_ adds the skills of a folder: choose the folder of one skill, or a folder with one folder per skill. The browser may ask whether to upload the files to the page: they stay on your computer. With _Remember this skill_, which is on by default, the browser keeps the skill for the next sessions, in every project, also in projects opened from a website; without it, the skill is kept until the page is closed. Each skill in the list can be turned off and on again, remembered or not (_Remember_), and removed.
+In the settings (⚙), _Add skill…_ adds the skills of a folder: choose the folder of one skill, or a folder with one folder per skill. The browser may ask whether to upload the files to the page: they stay on your computer. With _Remember this skill_, which is on by default, the browser keeps the skill for the next sessions, in every project, also in projects opened from a website; without it, the skill is kept until the page is closed. Each skill in the list can be turned off and on again, remembered or not (_Remember_), and removed. Click a description to read all of it, and again to fold it into one line.
+
+A project can also bring its own skills: put them in a folder `skills` next to the project file, with one folder per skill. When the project is opened from the connected folder, the panel reads that folder. When it is opened from a website, the panel cannot list a folder, so `skills/index.json` lists the files of the skills, as paths inside the `skills` folder:
+
+```json
+{ "files": ["lab-colors/SKILL.md", "lab-colors/references/palette.md"] }
+```
+
+In the list, the skills of the project are marked _project_ and those added by hand _added_. The skills of the project change when another project is opened, and cannot be remembered or removed, only turned off. If a skill added by hand has the same name as one of the project, the one added by hand is used while it is on.
 
 A skill must follow the rules of the format: its name is lowercase, with only letters, digits and hyphens, and is also the name of its folder, and it has a description. Fields of `SKILL.md` that are not part of the format, such as those of other agents, are ignored, and the list says so.
 
@@ -192,6 +200,8 @@ The names, tones and avatars of Dia and Aid, and the words shown while the model
 `SKILL.md` is read and checked in `skills.ts` like the reference validator of the format, [skills-ref](https://github.com/agentskills/agentskills/tree/main/skills-ref), does, except that unknown fields are ignored with a warning. Only the part of YAML that the frontmatter of skills uses is read, so that the plugin needs no YAML library. The skills added with _Remember this skill_ are kept in the browser's IndexedDB, in the database `tissuumaps.ai-chat`, as files rather than as read skills, so that they are read again with the rules of the plugin that opens them.
 
 The model sees the skills progressively, as the format intends: the names and descriptions of the skills that are on go with the context of each turn, between the project summary and the app state; the instructions of a skill come back as the result of the tool `load_skill(name)`, and its other files as the result of `read_skill_file(skill, path)` (text only, at most 50,000 characters). Both tools, and the rules for using skills, are always part of the tools and the fixed instructions of OpenAI and Anthropic, also without skills, so that the beginning of the requests stays the same for the prompt cache. They are in `skill-tools.ts`.
+
+The skills of the project are read in `project-skills.ts`, again whenever another project is opened or another folder is connected. The folder `skills` is found with `SourceUtils.normalizeSource("skills", workspace, source)`, like a project-relative data source: in the workspace, its files are listed (hidden ones left out, at most 1000); for a project opened from a URL, the files listed in `skills/index.json` are downloaded, and paths that leave the `skills` folder are refused. Without a `skills` folder or a `skills/index.json`, the project simply has no skills.
 
 ---
 

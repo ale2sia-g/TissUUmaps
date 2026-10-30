@@ -1,3 +1,4 @@
+import type { ProjectSkills } from "./project-skills";
 import type { SkillStorage, StoredSkill } from "./skill-storage";
 import { type FolderFile, type Skill, readSkills } from "./skills";
 import { makeButton, quietTextStyle, smallButtonStyle } from "./ui";
@@ -5,9 +6,11 @@ import { makeButton, quietTextStyle, smallButtonStyle } from "./ui";
 /** A skill in the list of the panel */
 type SkillEntry = {
   skill: Skill;
+  /** Whether it came with the open project, or the user added it by hand */
+  origin: "project" | "added";
   /** Whether the skill is on, so that the model can use it */
   enabled: boolean;
-  /** Whether the browser remembers it for the next sessions */
+  /** Whether the browser remembers it for the next sessions; never for skills of the project */
   remembered: boolean;
 };
 
@@ -16,11 +19,20 @@ export type SkillList = {
   /** The section */
   element: HTMLElement;
   /**
-   * The skills that are on
+   * The skills that are on; a skill added by hand that is on hides a skill
+   * of the project with the same name
    *
    * @returns The skills, by name
    */
   activeSkills: () => Skill[];
+  /**
+   * Shows the skills of the project that was opened, in place of those of
+   * the project before
+   *
+   * @param project - Its skills, `null` if it has none, or why they could
+   * not be read
+   */
+  setProjectSkills: (project: ProjectSkills | Error | null) => void;
 };
 
 /** The look of the checkboxes */
@@ -71,14 +83,59 @@ function makeCheckbox(
 }
 
 /**
- * Creates the section of the settings with the skills: "Add skill…" reads a
- * chosen folder, with one skill or a folder of skills; each skill can be
- * turned off and on, remembered by the browser or not, and removed
+ * Creates the description of a skill: one line, which a click (or Enter)
+ * opens in full and closes again
+ *
+ * @param text - The description
+ * @param open - Whether it starts open
+ * @param onToggle - Called with the new state
+ * @returns The element
+ */
+function makeDescription(
+  text: string,
+  open: boolean,
+  onToggle: (open: boolean) => void,
+): HTMLElement {
+  const description = document.createElement("div");
+  description.textContent = text;
+  description.tabIndex = 0;
+  description.setAttribute("role", "button");
+  description.style.cssText = `${quietTextStyle}cursor: pointer; overflow: hidden; text-overflow: ellipsis;`;
+  const show = (isOpen: boolean) => {
+    open = isOpen;
+    description.style.whiteSpace = open ? "normal" : "nowrap";
+    description.setAttribute("aria-expanded", String(open));
+    description.title = open
+      ? "Click to show one line"
+      : "Click to show the whole description";
+  };
+  const toggle = () => {
+    show(!open);
+    onToggle(open);
+  };
+  description.addEventListener("click", toggle);
+  description.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      toggle();
+    }
+  });
+  show(open);
+  return description;
+}
+
+/**
+ * Creates the section of the settings with the skills: those of the open
+ * project, and those added by hand. "Add skill…" reads a chosen folder, with
+ * one skill or a folder of skills. Each skill can be turned off and on; a
+ * skill added by hand can also be remembered by the browser or not, and
+ * removed.
  *
  * @param storage - Where the skills added by hand are remembered
  * @param onChange - Called when the skills that are on change
  * @param options - Optional abort signal, for the reads
- * @returns The section, and the skills that are on
+ * @returns The section, the skills that are on, and a way to show the skills
+ * of the project
  */
 export function makeSkillList(
   storage: SkillStorage,
@@ -86,7 +143,14 @@ export function makeSkillList(
   options?: { signal?: AbortSignal },
 ): SkillList {
   const { signal } = options ?? {};
+  /** The skills added by hand */
   const entries: SkillEntry[] = [];
+  /** The skills of the open project */
+  const projectEntries: SkillEntry[] = [];
+  /** Where the skills of the open project come from */
+  let projectWhere = "";
+  /** The descriptions shown in full, by origin and name */
+  const openDescriptions = new Set<string>();
 
   const title = document.createElement("strong");
   title.textContent = "Skills";
@@ -170,85 +234,135 @@ export function makeSkillList(
     }
   }
 
-  /** Shows the list of skills again */
-  function render(): void {
-    list.replaceChildren(
-      ...entries.map((entry) => {
-        const { skill } = entry;
-        const enabledLabel = makeCheckbox(skill.name, entry.enabled, (on) => {
-          entry.enabled = on;
+  /**
+   * Whether a skill of the project is hidden by a skill added by hand with
+   * the same name, which is on
+   *
+   * @param entry - The skill
+   * @returns Whether it is hidden
+   */
+  function isHidden(entry: SkillEntry): boolean {
+    return (
+      entry.origin === "project" &&
+      entries.some(
+        (other) => other.enabled && other.skill.name === entry.skill.name,
+      )
+    );
+  }
+
+  /**
+   * Creates the row of a skill in the list
+   *
+   * @param entry - The skill
+   * @returns The row
+   */
+  function makeRow(entry: SkillEntry): HTMLElement {
+    const { skill, origin } = entry;
+    const enabledLabel = makeCheckbox(skill.name, entry.enabled, (on) => {
+      entry.enabled = on;
+      render();
+      onChange();
+      if (entry.remembered) {
+        runSafely(store(entry).then((problem) => problem && report([problem])));
+      }
+    });
+    enabledLabel.title = entry.enabled
+      ? "On: the assistant can use this skill"
+      : "Off: the assistant does not see this skill";
+    enabledLabel.style.fontWeight = "600";
+    const tag = document.createElement("span");
+    tag.textContent = origin;
+    tag.title =
+      origin === "project"
+        ? `It comes with the open project, from ${projectWhere}`
+        : "You added it with Add skill…";
+    tag.style.cssText = `${quietTextStyle}border: 1px solid var(--border); border-radius: 6px; padding: 0 4px;`;
+    const top = document.createElement("div");
+    top.style.cssText =
+      "display: flex; flex-wrap: wrap; gap: 8px; align-items: center;";
+    top.append(enabledLabel, tag);
+
+    if (origin === "added") {
+      const rememberedLabel = makeCheckbox(
+        "Remember",
+        entry.remembered,
+        (on) => {
+          entry.remembered = on;
+          runSafely(
+            store(entry).then((problem) => {
+              report([
+                problem ||
+                  (on
+                    ? `${skill.name} is remembered by this browser.`
+                    : `${skill.name} is kept for this session only.`),
+              ]);
+              render();
+            }),
+          );
+        },
+      );
+      rememberedLabel.style.cssText += quietTextStyle;
+      rememberedLabel.title =
+        "Keep the skill in this browser for the next sessions, in every project";
+      const removeButton = makeButton(
+        "Remove",
+        () => {
+          entries.splice(entries.indexOf(entry), 1);
           render();
           onChange();
+          report([`${skill.name} removed.`]);
           if (entry.remembered) {
+            entry.remembered = false;
             runSafely(
               store(entry).then((problem) => problem && report([problem])),
             );
           }
-        });
-        enabledLabel.title = entry.enabled
-          ? "On: the assistant can use this skill"
-          : "Off: the assistant does not see this skill";
-        enabledLabel.style.fontWeight = "600";
-        const rememberedLabel = makeCheckbox(
-          "Remember",
-          entry.remembered,
-          (on) => {
-            entry.remembered = on;
-            runSafely(
-              store(entry).then((problem) => {
-                report([
-                  problem ||
-                    (on
-                      ? `${skill.name} is remembered by this browser.`
-                      : `${skill.name} is kept for this session only.`),
-                ]);
-                render();
-              }),
-            );
-          },
-        );
-        rememberedLabel.style.cssText += quietTextStyle;
-        rememberedLabel.title =
-          "Keep the skill in this browser for the next sessions, in every project";
-        const removeButton = makeButton(
-          "Remove",
-          () => {
-            entries.splice(entries.indexOf(entry), 1);
-            render();
-            onChange();
-            report([`${skill.name} removed.`]);
-            if (entry.remembered) {
-              entry.remembered = false;
-              runSafely(
-                store(entry).then((problem) => problem && report([problem])),
-              );
-            }
-          },
-          smallButtonStyle,
-        );
-        removeButton.setAttribute("aria-label", `Remove ${skill.name}`);
-        const top = document.createElement("div");
-        top.style.cssText =
-          "display: flex; flex-wrap: wrap; gap: 8px; align-items: center;";
-        top.append(enabledLabel, rememberedLabel, removeButton);
+        },
+        smallButtonStyle,
+      );
+      removeButton.setAttribute("aria-label", `Remove ${skill.name}`);
+      top.append(rememberedLabel, removeButton);
+    }
 
-        const description = document.createElement("div");
-        description.textContent = skill.description;
-        description.title = skill.description;
-        description.style.cssText = `${quietTextStyle}overflow: hidden; text-overflow: ellipsis; white-space: nowrap;`;
-        const row = document.createElement("div");
-        row.style.cssText = `display: flex; flex-direction: column; gap: 2px; opacity: ${entry.enabled ? 1 : 0.6};`;
-        row.append(top, description);
-        for (const warning of skill.warnings) {
-          const line = document.createElement("div");
-          line.textContent = `${skill.name}: ${warning}`;
-          line.style.cssText = quietTextStyle;
-          row.append(line);
+    const key = `${origin}:${skill.name}`;
+    const description = makeDescription(
+      skill.description,
+      openDescriptions.has(key),
+      (open) => {
+        if (open) {
+          openDescriptions.add(key);
+        } else {
+          openDescriptions.delete(key);
         }
-        return row;
-      }),
+      },
     );
-    if (entries.length === 0) {
+    const row = document.createElement("div");
+    row.style.cssText = `display: flex; flex-direction: column; gap: 2px; opacity: ${entry.enabled && !isHidden(entry) ? 1 : 0.6};`;
+    row.append(top, description);
+    const notes = [
+      ...(isHidden(entry)
+        ? ["not used: a skill added by hand has the same name"]
+        : []),
+      ...skill.warnings,
+    ];
+    for (const note of notes) {
+      const line = document.createElement("div");
+      line.textContent = `${skill.name}: ${note}`;
+      line.style.cssText = quietTextStyle;
+      row.append(line);
+    }
+    return row;
+  }
+
+  /** Shows the list of skills again */
+  function render(): void {
+    const all = [...entries, ...projectEntries].sort(
+      (a, b) =>
+        a.skill.name.localeCompare(b.skill.name) ||
+        (a.origin === "added" ? -1 : 1),
+    );
+    list.replaceChildren(...all.map(makeRow));
+    if (all.length === 0) {
       const empty = document.createElement("div");
       empty.textContent =
         "No skills yet. A skill is a folder with a SKILL.md file: instructions, and maybe scripts, for the assistant.";
@@ -258,7 +372,8 @@ export function makeSkillList(
   }
 
   /**
-   * Puts skills in the list, in place of those with the same name
+   * Puts skills added by hand in the list, in place of those with the same
+   * name
    *
    * @param added - The skills, with their state
    * @returns The names of the skills that were replaced
@@ -276,7 +391,6 @@ export function makeSkillList(
         replaced.push(entry.skill.name);
       }
     }
-    entries.sort((a, b) => a.skill.name.localeCompare(b.skill.name));
     return replaced;
   }
 
@@ -293,8 +407,9 @@ export function makeSkillList(
       return;
     }
     const { skills, problems } = await readSkills(files, { signal });
-    const added = skills.map((skill) => ({
+    const added: SkillEntry[] = skills.map((skill) => ({
       skill,
+      origin: "added",
       enabled: true,
       remembered: rememberBox.checked,
     }));
@@ -340,7 +455,12 @@ export function makeSkillList(
       for (const { name, enabled, files } of stored) {
         const { skills, problems } = await readSkills(files, { signal });
         loaded.push(
-          ...skills.map((skill) => ({ skill, enabled, remembered: true })),
+          ...skills.map((skill) => ({
+            skill,
+            origin: "added" as const,
+            enabled,
+            remembered: true,
+          })),
         );
         for (const { error } of problems) {
           lines.push(`The remembered skill ${name} cannot be read: ${error}.`);
@@ -366,13 +486,61 @@ export function makeSkillList(
     }
   }
 
+  /**
+   * Shows the skills of the project that was opened
+   *
+   * @param project - Its skills, `null` if it has none, or why they could
+   * not be read
+   */
+  function setProjectSkills(project: ProjectSkills | Error | null): void {
+    projectEntries.length = 0;
+    projectWhere = "";
+    const lines: string[] = [];
+    if (project instanceof Error) {
+      lines.push(
+        `The skills of the project cannot be read: ${project.message}.`,
+      );
+    } else if (project !== null) {
+      projectWhere = project.where;
+      projectEntries.push(
+        ...project.skills.map((skill) => ({
+          skill,
+          origin: "project" as const,
+          enabled: true,
+          remembered: false,
+        })),
+      );
+      if (project.skills.length > 0) {
+        lines.push(
+          `From the project: ${project.skills.map(({ name }) => name).join(", ")}.`,
+        );
+      }
+      for (const { folder, error } of project.problems) {
+        lines.push(`Not added from the project: ${folder}: ${error}.`);
+      }
+    }
+    render();
+    onChange();
+    if (lines.length > 0) {
+      report(lines);
+    }
+  }
+
   folderInput.addEventListener("change", () => runSafely(addChosenFolder()));
   render();
   runSafely(loadRemembered());
 
   return {
     element,
-    activeSkills: () =>
-      entries.filter(({ enabled }) => enabled).map(({ skill }) => skill),
+    activeSkills: () => {
+      const added = entries.filter(({ enabled }) => enabled);
+      const fromProject = projectEntries.filter(
+        (entry) => entry.enabled && !isHidden(entry),
+      );
+      return [...added, ...fromProject]
+        .map(({ skill }) => skill)
+        .sort((a, b) => a.name.localeCompare(b.name));
+    },
+    setProjectSkills,
   };
 }

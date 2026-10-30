@@ -115,7 +115,11 @@ export const helpText = `How to use this chat
    https://agentskills.io). Add skills in the settings (⚙, "Add skill…"):
    choose the folder of one skill, or a folder of skills. With "Remember this
    skill", this browser keeps it for every project. Each skill can be turned off
-   and on, and removed. With OpenAI and Anthropic, the assistant sees the names
+   and on, and removed. Click a description to read all of it.
+   A project can bring its own skills, in a folder "skills" next to the project
+   file (for a project on a website, with a list of its files in
+   skills/index.json). They are marked "project", those you added "added".
+   With OpenAI and Anthropic, the assistant sees the names
    and descriptions of the skills that are on, and reads a skill's instructions
    only when a request needs them. Ollama's models do not use skills.
 

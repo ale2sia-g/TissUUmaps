@@ -12,6 +12,7 @@ import {
 import { renderMarkdown } from "./markdown";
 import { findById, isMapKind, same } from "./objects";
 import { personaFor } from "./persona";
+import { loadProjectSkills } from "./project-skills";
 import {
   type ChatAnswer,
   type ChatMessage,
@@ -255,12 +256,46 @@ export function mountAiChat(
   statusRow.style.cssText = "display: flex; gap: 8px; align-items: center;";
   statusRow.append(status, checkButton);
 
-  // the skills added by hand, remembered by the browser if the user wants
+  // the skills of the open project, and those added by hand, remembered by
+  // the browser if the user wants
   const skillList = makeSkillList(
     { load: loadStoredSkills, save: storeSkill, remove: forgetStoredSkill },
     updateLayout,
     { signal },
   );
+  /** The project and workspace whose skills were read last */
+  let skillsRead: { instanceId: string; workspace: unknown } | null = null;
+
+  /**
+   * Reads the skills of the open project again when another project is
+   * opened or another folder connected; a later read wins over an earlier one
+   */
+  function readProjectSkills(): void {
+    const { source, instanceId } = projectStore.getState();
+    const workspace = appStore.getState().workspace ?? null;
+    if (
+      skillsRead?.instanceId === instanceId &&
+      skillsRead.workspace === workspace
+    ) {
+      return;
+    }
+    const read = { instanceId, workspace };
+    skillsRead = read;
+    loadProjectSkills(source, workspace, { signal }).then(
+      (project) => {
+        if (skillsRead === read) {
+          skillList.setProjectSkills(project);
+        }
+      },
+      (error: unknown) => {
+        if (!signal.aborted && skillsRead === read) {
+          skillList.setProjectSkills(
+            error instanceof Error ? error : new Error(String(error)),
+          );
+        }
+      },
+    );
+  }
 
   const settingsBox = document.createElement("div");
   settingsBox.style.cssText =
@@ -1540,7 +1575,10 @@ export function mountAiChat(
 
   const unsubscribeData = dataStore.subscribe(readTables);
   const unsubscribeProject = projectStore.subscribe(onProjectChange);
+  const unsubscribeProjectSkills = projectStore.subscribe(readProjectSkills);
+  const unsubscribeWorkspace = appStore.subscribe(readProjectSkills);
   readTables();
+  readProjectSkills();
   showKey();
   fillModelMenu();
   updateStatus();
@@ -1554,6 +1592,8 @@ export function mountAiChat(
     observer.disconnect();
     unsubscribeData();
     unsubscribeProject();
+    unsubscribeProjectSkills();
+    unsubscribeWorkspace();
     unsubscribeSettings();
     document.removeEventListener("selectionchange", updateQuoteButton);
   };

@@ -3084,6 +3084,62 @@ describe("aiChatPlugin", () => {
       expect(skillMd).toContain("name: lab-colors");
     });
 
+    it("uses the skills next to the project file in the connected folder", async () => {
+      /** A folder of the connected folder, as the File System API gives it */
+      const folder = (name: string, entries: { name: string }[]) => ({
+        kind: "directory",
+        name,
+        getDirectoryHandle: (entryName: string) => {
+          const entry = entries.find((e) => e.name === entryName);
+          return entry && "values" in entry
+            ? Promise.resolve(entry)
+            : Promise.reject(new DOMException(entryName, "NotFoundError"));
+        },
+        getFileHandle: (entryName: string) =>
+          Promise.reject(
+            new DOMException(
+              entryName,
+              entries.some((e) => e.name === entryName)
+                ? "TypeMismatchError"
+                : "NotFoundError",
+            ),
+          ),
+        async *values() {
+          yield* await Promise.resolve(entries);
+        },
+      });
+      const file = (name: string, text: string) => ({
+        kind: "file",
+        name,
+        getFile: () => Promise.resolve(new File([text], name)),
+      });
+      const panel = await openPanel(undefined, undefined, {
+        provider: "anthropic",
+      });
+      await panel.pasteKey(anthropicKey);
+      panel.appStore.setState({
+        workspace: folder("root", [
+          folder("xenium", [
+            file("project.json", "{}"),
+            folder("skills", [
+              folder("lab-colors", [file("SKILL.md", labColors)]),
+            ]),
+          ]),
+        ]) as unknown as FileSystemDirectoryHandle,
+      });
+      panel.projectStore.openOtherProject({ source: "/xenium/project.json" });
+      await vi.waitFor(() =>
+        expect(panel.container.textContent).toContain(
+          "From the project: lab-colors.",
+        ),
+      );
+      expect(panel.summary.textContent).toContain("· key ✓ · 1 skill");
+      await panel.say("Color the cell types.");
+      expect(turnText("anthropic", services.requests.at(-1)?.body)).toContain(
+        "- lab-colors: The color conventions of our lab.",
+      );
+    });
+
     it("offers no skills to Ollama", async () => {
       const panel = await openPanel();
       await addSkills(panel.container, { "hello/SKILL.md": hello });

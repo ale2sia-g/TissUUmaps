@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { makeSkillList } from "./skill-list";
 import type { SkillStorage, StoredSkill } from "./skill-storage";
+import { createSkill } from "./skills";
 
 /** A SKILL.md with a name and a description */
 function skillMd(name: string, description = `What ${name} does.`): string {
@@ -260,5 +261,123 @@ describe("makeSkillList", () => {
     expect(status(element)).toBe(
       "The remembered skills cannot be read: blocked.",
     );
+  });
+
+  describe("the skills of the project", () => {
+    /** The skills of a project, from SKILL.md files */
+    function projectSkills(...names: string[]) {
+      return {
+        skills: names.map((name) =>
+          createSkill(
+            name,
+            skillMd(name, `${name} of the project.`),
+            new Map(),
+          ),
+        ),
+        problems: [],
+        where: "/xenium/skills",
+      };
+    }
+
+    /** The tags of the rows of the list, e.g. "hello project" */
+    function rows(element: HTMLElement): string[] {
+      return [...element.querySelectorAll("label")]
+        .filter((label) => !label.textContent.startsWith("Remember"))
+        .map(
+          (label) => `${label.textContent} ${label.nextSibling?.textContent}`,
+        );
+    }
+
+    it("shows them apart from those added by hand, without Remember and Remove", async () => {
+      const { element, list, onChange } = await mountList(
+        fakeStorage().storage,
+      );
+      await chooseFolder(element, { "zeta/SKILL.md": skillMd("zeta") });
+      onChange.mockClear();
+      list.setProjectSkills(projectSkills("lab-colors"));
+      expect(status(element)).toBe("From the project: lab-colors.");
+      expect(rows(element)).toEqual(["lab-colors project", "zeta added"]);
+      expect(
+        element.querySelectorAll("button[aria-label^=Remove]"),
+      ).toHaveLength(1);
+      expect(
+        [...element.querySelectorAll("label")].filter(
+          (label) => label.textContent === "Remember",
+        ),
+      ).toHaveLength(1);
+      expect(list.activeSkills().map((skill) => skill.name)).toEqual([
+        "lab-colors",
+        "zeta",
+      ]);
+      expect(onChange).toHaveBeenCalled();
+
+      await click(checkbox(element, "lab-colors"));
+      expect(list.activeSkills().map((skill) => skill.name)).toEqual(["zeta"]);
+    });
+
+    it("are hidden by a skill added by hand with the same name, while it is on", async () => {
+      const { element, list } = await mountList(fakeStorage().storage);
+      list.setProjectSkills(projectSkills("hello"));
+      await chooseFolder(element, {
+        "hello/SKILL.md": skillMd("hello", "Mine."),
+      });
+      expect(rows(element)).toEqual(["hello added", "hello project"]);
+      expect(list.activeSkills().map((skill) => skill.description)).toEqual([
+        "Mine.",
+      ]);
+      expect(element.textContent).toContain(
+        "hello: not used: a skill added by hand has the same name",
+      );
+
+      await click(checkbox(element, "hello", 0));
+      expect(list.activeSkills().map((skill) => skill.description)).toEqual([
+        "hello of the project.",
+      ]);
+    });
+
+    it("change with the project, and say why they cannot be read", async () => {
+      const { element, list } = await mountList(fakeStorage().storage);
+      list.setProjectSkills({
+        ...projectSkills("hello"),
+        problems: [
+          { folder: "Bad", error: 'the name "Bad" must be lowercase' },
+        ],
+      });
+      expect(status(element)).toBe(
+        'From the project: hello.\nNot added from the project: Bad: the name "Bad" must be lowercase.',
+      );
+      list.setProjectSkills(null);
+      expect(list.activeSkills()).toEqual([]);
+      expect(element.textContent).toContain("No skills yet");
+
+      list.setProjectSkills(new Error("permission denied"));
+      expect(status(element)).toBe(
+        "The skills of the project cannot be read: permission denied.",
+      );
+    });
+  });
+
+  it("opens the whole description with a click, and closes it again", async () => {
+    const { element } = await mountList(fakeStorage().storage);
+    await chooseFolder(element, {
+      "hello/SKILL.md": skillMd("hello", "A very long description."),
+      "zeta/SKILL.md": skillMd("zeta"),
+    });
+    const description = () =>
+      [...element.querySelectorAll<HTMLElement>("[role=button]")].find(
+        (candidate) => candidate.textContent === "A very long description.",
+      )!;
+    expect(description().style.whiteSpace).toBe("nowrap");
+    expect(description().getAttribute("aria-expanded")).toBe("false");
+
+    description().click();
+    expect(description().style.whiteSpace).toBe("normal");
+    expect(description().getAttribute("aria-expanded")).toBe("true");
+    // it stays open when the list is shown again
+    await click(checkbox(element, "zeta"));
+    expect(description().getAttribute("aria-expanded")).toBe("true");
+
+    description().dispatchEvent(new KeyboardEvent("keydown", { key: "Enter" }));
+    expect(description().style.whiteSpace).toBe("nowrap");
   });
 });
