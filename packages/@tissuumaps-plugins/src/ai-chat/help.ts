@@ -29,8 +29,8 @@ export const helpText = `How to use this chat
    ⚙ opens them again, to change, forget or check the key. They also open by
    themselves when something goes wrong.
    Each request is billed to your account, and your messages and the project
-   summary are sent to the service you chose. Under each answer, a small line
-   shows the tokens used (input, read from and written to the service's cache,
+   summary are sent to the service you chose. Under each answer, "Usage" shows
+   the tokens used (input, read from and written to the service's cache,
    output) and about how much they cost; the bill of the service counts.
    These models also get the types and the current state of the whole app,
    so they can answer detailed questions about the settings of each object,
@@ -99,6 +99,8 @@ export const helpText = `How to use this chat
    In the text box, the up and down arrows go through the messages you sent
    before, like in a terminal.
    Select a part of an answer and click "Quote" to quote it in your next message.
+   "Copy", next to the assistant's name, copies a whole answer; the code of a
+   script has its own "Copy".
    While the model thinks, a word in Italian changes every few seconds: point
    at it to see what it means in English.
 
@@ -122,12 +124,13 @@ export const helpText = `How to use this chat
    With OpenAI and Anthropic, the assistant sees the names
    and descriptions of the skills that are on, and reads a skill's instructions
    only when a request needs them. Ollama's models do not use skills.
-   A skill can also bring JavaScript scripts, e.g. to compute on the data. Their
-   code is always shown in the chat before they run. They run in a sandbox:
+   A skill can also bring JavaScript scripts, e.g. to compute on the data. Each
+   is shown in the chat before it runs, as one line (📜): click it to read its
+   code. They run in a sandbox:
    they can read the data, but cannot change the project, use the internet or
    see your API key. "Stop" stops a script, and after two minutes it stops by
    itself. Before the scripts of a skill that came with the project run for the
-   first time, you are asked.
+   first time, their code opens and you are asked.
 
 What the assistant can do: answer questions about the open project, show or hide
 images, labels, points and shapes, make them more or less transparent, make

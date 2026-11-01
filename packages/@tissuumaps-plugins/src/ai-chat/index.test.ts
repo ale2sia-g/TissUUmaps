@@ -2249,6 +2249,14 @@ describe("aiChatPlugin", () => {
           "Tokens (2 requests): 6,000 input · 12,000 from cache · 0 written to cache · 160 output · ≈ $0.0008 · this session ≈ $0.0008",
           "Tokens: 3,000 input · 6,000 from cache · 0 written to cache · 80 output · ≈ $0.0004 · this session ≈ $0.0012",
         ]);
+        // folded under "Usage", which opens them with a click
+        const usage = [...panel.container.querySelectorAll("[data-usage]")].map(
+          (line) => line.parentElement as HTMLDetailsElement,
+        );
+        expect(
+          usage.map((box) => box.querySelector("summary")?.textContent),
+        ).toEqual(["Usage", "Usage"]);
+        expect(usage.map((box) => box.open)).toEqual([false, false]);
         // under the answers, not in their text
         expect(panel.texts("Dia")).toEqual([
           "The transcripts are visible.",
@@ -2565,7 +2573,11 @@ describe("aiChatPlugin", () => {
 
     it("folds each tool call into one line, and Show tool details opens them all, remembered by the browser", async () => {
       const rows = (panel: { container: HTMLElement }) =>
-        [...panel.container.querySelectorAll("details")].map((details) => ({
+        [
+          ...panel.container.querySelectorAll<HTMLDetailsElement>(
+            '[data-who="Tool"] > details',
+          ),
+        ].map((details) => ({
           open: details.open,
           summary: details.querySelector("summary")?.textContent ?? "",
         }));
@@ -3197,6 +3209,18 @@ describe("aiChatPlugin", () => {
       "Run scripts/count.js.",
     ].join("\n");
 
+    /** The rows of the scripts: their line, and whether their code is open */
+    function scriptRows(container: HTMLElement) {
+      return [
+        ...container.querySelectorAll<HTMLDetailsElement>(
+          '[data-who="Script"] details',
+        ),
+      ].map((details) => ({
+        line: details.querySelector("summary")?.textContent,
+        open: details.open,
+      }));
+    }
+
     beforeEach(() => {
       sandbox.runs.length = 0;
       sandbox.behavior = "done";
@@ -3243,9 +3267,11 @@ describe("aiChatPlugin", () => {
       ];
       await panel.say("How many tables are there?");
       expect(confirm).not.toHaveBeenCalled();
-      expect(panel.texts("Script")).toEqual([
-        `🧪 counter: scripts/count.js (JavaScript)${countScript}`,
+      // one folded row, whose code opens with a click
+      expect(scriptRows(panel.container)).toEqual([
+        { line: "📜 counter/scripts/count.js", open: false },
       ]);
+      expect(panel.texts("Script")).toEqual([countScript]);
       const [tool] = panel.texts("Tool");
       expect(tool).toMatch(
         /^run_script\(skill: counter, path: scripts\/count\.js, args: \{"column":"obs\/leiden"\}\)\n→ Done: ran scripts\/count\.js of the skill "counter" in \d+\.\d s\.\n\nResult:\n1 tables\n\nLog:\nhello from the script$/,
@@ -3267,8 +3293,58 @@ describe("aiChatPlugin", () => {
       );
     });
 
+    it("copies an answer as the model wrote it, and the code of a script", async () => {
+      const writeText = vi.fn(() => Promise.resolve());
+      vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
+      const panel = await panelWithSkills();
+      await addSkills(panel.container, {
+        "counter/SKILL.md": counter,
+        "counter/scripts/count.js": countScript,
+      });
+      services.answers = [
+        {
+          toolCalls: [
+            ["run_script", { skill: "counter", path: "scripts/count.js" }],
+          ],
+        },
+        { content: "There is **1** table." },
+      ];
+      await panel.say("How many tables are there?");
+      const copyButtons = panel.container.querySelectorAll<HTMLButtonElement>(
+        'button[title="Copy the code"], button[title="Copy the answer"]',
+      );
+      expect([...copyButtons].map((button) => button.title)).toEqual([
+        "Copy the code",
+        "Copy the answer",
+      ]);
+      for (const button of copyButtons) {
+        button.click();
+      }
+      expect(writeText.mock.calls).toEqual([
+        [countScript],
+        ["There is **1** table."],
+      ]);
+      await vi.waitFor(() =>
+        expect(copyButtons[1]?.textContent).toBe("Copied"),
+      );
+
+      // without a clipboard, e.g. in a page that is not secure
+      vi.stubGlobal("navigator", { ...navigator, clipboard: undefined });
+      copyButtons[1]?.click();
+      await vi.waitFor(() =>
+        expect(copyButtons[1]?.textContent).toBe("Not copied"),
+      );
+      vi.unstubAllGlobals();
+    });
+
     it("asks once before running the scripts of a skill of the project, and runs nothing without permission", async () => {
-      const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+      let allow = false;
+      // whether the code was open when the user was asked
+      const openWhenAsked: boolean[] = [];
+      const confirm = vi.spyOn(window, "confirm").mockImplementation(() => {
+        openWhenAsked.push(scriptRows(panel.container).at(-1)?.open ?? false);
+        return allow;
+      });
       const panel = await openPanel(undefined, undefined, {
         provider: "anthropic",
       });
@@ -3300,7 +3376,7 @@ describe("aiChatPlugin", () => {
         'Error: the user did not allow the scripts of the skill "counter", which came with the project.',
       );
 
-      confirm.mockReturnValue(true);
+      allow = true;
       services.answers = [
         { toolCalls: [runCount()] },
         { toolCalls: [runCount()] },
@@ -3309,6 +3385,13 @@ describe("aiChatPlugin", () => {
       await panel.say("Count the tables, I allow it.");
       expect(confirm).toHaveBeenCalledTimes(2);
       expect(sandbox.runs).toHaveLength(2);
+      // the code opens by itself when the user is asked, and stays open
+      expect(openWhenAsked).toEqual([true, true]);
+      expect(scriptRows(panel.container).map(({ open }) => open)).toEqual([
+        true,
+        true,
+        false,
+      ]);
     });
 
     it("stops a script with Stop, and explains scripts that fail or cannot run", async () => {

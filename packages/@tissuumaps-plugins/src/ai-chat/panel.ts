@@ -70,9 +70,11 @@ import {
   firstLine,
   makeAvatar,
   makeButton,
+  makeCopyButton,
   makeThinkingIndicator,
   messageStyles,
   notReachable,
+  quietButtonStyle,
   quietTextStyle,
   smallButtonStyle,
   toolIcons,
@@ -488,6 +490,7 @@ export function mountAiChat(
    */
   function addFrame(who: string, kind: MessageKind): HTMLElement {
     const message = document.createElement("div");
+    message.dataset.who = who;
     message.style.cssText =
       "padding: 6px 8px; border: 1px solid; border-radius: 6px; white-space: pre-wrap;" +
       messageStyles[kind];
@@ -518,8 +521,11 @@ export function mountAiChat(
     history.scrollTop = history.scrollHeight;
   }
 
-  /** The tool rows, which open and close with "Show tool details" */
-  const toolRows: { details: HTMLDetailsElement; failed: boolean }[] = [];
+  /**
+   * The rows of the tools and the scripts, which open and close with "Show
+   * tool details", except those kept open
+   */
+  const toolRows: { details: HTMLDetailsElement; keepOpen: boolean }[] = [];
 
   /**
    * Shows a tool call as one folded row: an icon and the first line of the
@@ -551,13 +557,13 @@ export function mountAiChat(
     details.append(line, body);
     message.append(details);
     addToHistory(message);
-    toolRows.push({ details, failed });
+    toolRows.push({ details, keepOpen: failed });
   }
 
   /** Opens or folds the rows of the tools, as "Show tool details" says */
   function updateToolRows(): void {
-    for (const { details, failed } of toolRows) {
-      details.open = failed || showToolDetails;
+    for (const { details, keepOpen } of toolRows) {
+      details.open = keepOpen || showToolDetails;
     }
   }
 
@@ -571,11 +577,17 @@ export function mountAiChat(
     markdown = false,
   ): (text: string) => void {
     const body = addFrame(who, kind);
+    let shownText = "";
     if (kind === "assistant") {
       // a part of the answers can be quoted
       body.dataset.quotable = "true";
+      // the answer as the model wrote it, e.g. with its Markdown
+      const copyButton = makeCopyButton(() => shownText, "the answer");
+      copyButton.style.marginLeft = "auto";
+      body.previousElementSibling?.append(copyButton);
     }
     return (text) => {
+      shownText = text;
       body.replaceChildren(markdown ? renderMarkdown(text) : text);
       history.scrollTop = history.scrollHeight;
     };
@@ -1258,9 +1270,9 @@ export function mountAiChat(
   }
 
   /**
-   * Shows under the last message of a turn the tokens of its requests, and
-   * for the services that bill them, about how much they cost, also in total
-   * since the panel was opened
+   * Shows under the last message of a turn, folded under "Usage", the tokens
+   * of its requests, and for the services that bill them, about how much they
+   * cost, also in total since the panel was opened
    */
   function showUsage(
     provider: Provider,
@@ -1297,11 +1309,19 @@ export function mountAiChat(
         `this session ≈ ${dollars(sessionCost)}`,
       );
     }
+    // folded, so that the chat is not crowded
+    const usageBox = document.createElement("details");
+    usageBox.style.cssText = "margin-top: 4px;";
+    const toggle = document.createElement("summary");
+    toggle.style.cssText = `${quietButtonStyle}width: fit-content;`;
+    toggle.textContent = "Usage";
+    toggle.title = "The tokens of this request, and about how much they cost";
     const line = document.createElement("div");
     line.dataset.usage = "true";
-    line.style.cssText = `${quietTextStyle}font-size: 11px; margin-top: 4px;`;
+    line.style.cssText = `${quietTextStyle}font-size: 11px; margin-top: 2px;`;
     line.textContent = `Tokens${requests > 1 ? ` (${requests} requests)` : ""}: ${parts.join(" · ")}`;
-    message.append(line);
+    usageBox.append(toggle, line);
+    message.append(usageBox);
   }
 
   /**
@@ -1369,22 +1389,50 @@ export function mountAiChat(
   }
 
   /**
-   * Shows the code of a script in the chat, always open, before it runs
+   * Shows a script in the chat before it runs, as one row like those of the
+   * tools, e.g. "📜 counter/scripts/count.js", whose code opens with a click
    *
    * @param skill - The skill of the script
    * @param path - The path of the script in the skill
    * @param code - The code
+   * @returns Opens the code and keeps it open, e.g. while the user is asked
+   * whether the script may run
    */
-  function showScript(skill: Skill, path: string, code: string): void {
-    const body = addFrame("Script", "tool");
-    const title = document.createElement("div");
-    title.textContent = `🧪 ${skill.name}: ${path} (JavaScript)`;
+  function showScript(skill: Skill, path: string, code: string): () => void {
+    const message = document.createElement("div");
+    message.dataset.who = "Script";
+    message.style.cssText =
+      "padding: 4px 8px; border: 1px solid; border-radius: 6px;" +
+      messageStyles.tool;
+    const details = document.createElement("details");
+    details.open = showToolDetails;
+    const line = document.createElement("summary");
+    line.style.cssText =
+      "cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;";
+    line.textContent = `📜 ${skill.name}/${path}`;
+    line.title = `${path}, a JavaScript script of the skill "${skill.name}": click to read its code`;
     const pre = document.createElement("pre");
+    pre.dataset.details = "true";
     pre.textContent = code;
     pre.style.cssText =
-      "margin: 4px 0 0; max-height: 240px; overflow: auto; white-space: pre;" +
+      "margin: 0; max-height: 240px; overflow: auto; white-space: pre;" +
       "font-family: monospace; font-size: 12px;";
-    body.append(title, pre);
+    const copyButton = makeCopyButton(() => code, "the code");
+    copyButton.style.alignSelf = "flex-end";
+    const body = document.createElement("div");
+    body.style.cssText =
+      "display: flex; flex-direction: column; margin-top: 4px;";
+    body.append(copyButton, pre);
+    details.append(line, body);
+    message.append(details);
+    addToHistory(message);
+    const row = { details, keepOpen: false };
+    toolRows.push(row);
+    return () => {
+      row.keepOpen = true;
+      details.open = true;
+      history.scrollTop = history.scrollHeight;
+    };
   }
 
   /**
@@ -1410,10 +1458,12 @@ export function mountAiChat(
     stop?.throwIfAborted();
     const code = (await skill.files.get(path)?.text()) ?? "";
     stop?.throwIfAborted();
-    showScript(skill, path, code);
+    const openCode = showScript(skill, path, code);
     const from = skillList.projectSourceOf(skill);
     const key = `${projectStore.getState().instanceId}:${skill.name}`;
     if (from !== undefined && !allowedScripts.has(key)) {
+      // the user must be able to read the code before saying yes
+      openCode();
       // time to show the code before the question, which blocks the page
       await new Promise((resolve) => setTimeout(resolve, 100));
       const allowed = window.confirm(

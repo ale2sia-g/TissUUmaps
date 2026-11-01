@@ -61,6 +61,56 @@ export function makeButton(
   return button;
 }
 
+/** The look of the small, quiet buttons, e.g. "Copy" and "Usage" */
+export const quietButtonStyle =
+  `${quietTextStyle}font-size: 11px; background: none; border: none;` +
+  "padding: 0 2px; cursor: pointer; font-family: inherit;";
+
+/** How long a copy button says "Copied", in milliseconds */
+const copiedTime = 1500;
+
+/**
+ * Creates a small button that copies a text, e.g. an answer or the code of a
+ * script, and says for a moment whether it worked
+ *
+ * @param text - The text to copy, when the button is clicked
+ * @param what - What is copied, for the tooltip, e.g. "the answer"
+ * @returns The button
+ */
+export function makeCopyButton(
+  text: () => string,
+  what: string,
+): HTMLButtonElement {
+  const title = `Copy ${what}`;
+  const button = makeButton(
+    "Copy",
+    () => {
+      // the clipboard is missing in pages that are not secure (http, not
+      // localhost), and the browser can refuse it
+      const copied =
+        typeof navigator.clipboard?.writeText === "function"
+          ? navigator.clipboard.writeText(text())
+          : Promise.reject(new Error("no clipboard"));
+      copied
+        .then(() => {
+          button.textContent = "Copied";
+          button.title = title;
+        })
+        .catch(() => {
+          button.textContent = "Not copied";
+          button.title =
+            "The browser did not allow copying: select the text and copy it by hand";
+        })
+        .finally(() => {
+          setTimeout(() => (button.textContent = "Copy"), copiedTime);
+        });
+    },
+    quietButtonStyle,
+  );
+  button.title = title;
+  return button;
+}
+
 /**
  * Creates the avatar shown next to the assistant's name: the image of the
  * personality, or an empty round placeholder until there is one

@@ -25,7 +25,7 @@ Every request sends the model a summary of the project: the objects, how they ar
 
 All changes go through the project, like changes made by hand. _Undo_ takes back the changes of the last request, and _Undo all_ takes back every change made by the chat; settings changed by hand in the meantime are left as they are. _New chat_ starts a new conversation; Undo keeps working for the earlier changes.
 
-A few suggested requests for the open project are shown above the text box; click one to send it, without losing what you are typing. In the text box, the up and down arrows go through the messages you sent before, like in a terminal. To refer to a part of an answer, select it and click _Quote_: it is quoted in your next message.
+A few suggested requests for the open project are shown above the text box; click one to send it, without losing what you are typing. In the text box, the up and down arrows go through the messages you sent before, like in a terminal. To refer to a part of an answer, select it and click _Quote_: it is quoted in your next message. _Copy_, next to the name of the assistant, copies a whole answer as the model wrote it (with its Markdown), and the code of a script has its own _Copy_.
 
 While the model works, until its final answer (also while a tool runs, and between one tool and the next), three dots blink next to an Italian word that changes every few seconds (_pensando_, _impastando_, _sbirciando nelle cellule_...), below the last message; point at the word to see what it means in English.
 
@@ -56,7 +56,7 @@ With OpenAI, Anthropic and Ollama (cloud), your messages and the project summary
 
 ## Using OpenAI or Anthropic
 
-TissUUmaps does not provide API keys: everyone uses their own. An API key is a secret code that lets the chat use your account, and every request is billed to that account, so first add a payment method or buy credit there. With the first model in the menu (`gpt-6-luna` or `claude-haiku-5-5`), a request usually costs well under one cent; the other models cost more. Under each answer, a small line shows the tokens used (input, read from and written to the service's prompt cache, output) and about how much they cost, also in total since the panel was opened. These are estimates from the published prices: the bill of the service counts.
+TissUUmaps does not provide API keys: everyone uses their own. An API key is a secret code that lets the chat use your account, and every request is billed to that account, so first add a payment method or buy credit there. With the first model in the menu (`gpt-6-luna` or `claude-haiku-5-5`), a request usually costs well under one cent; the other models cost more. Under each answer, a click on _Usage_ shows the tokens used (input, read from and written to the service's prompt cache, output) and about how much they cost, also in total since the panel was opened. These are estimates from the published prices: the bill of the service counts.
 
 These models also get the types and the current state of the whole app (see [API](#api)), so they can answer detailed questions about the settings of each object, e.g. _"which properties of the labels can I change?"_, and change most of them: _"make channel 1 of morphology_focus red"_, _"show only the DAPI channel of morphology_focus"_, _"show the transcripts as squares"_, _"rotate the H&E image by 90 degrees"_, _"put the H&E image on top"_, _"highlight cluster 3 of the cell labels"_. They use the same tools as with Ollama when those are enough, and otherwise call one of the allowed actions of the app state. Every change goes through Undo. They never delete or add objects or change where their data comes from, and they rename something only when you ask.
 
@@ -160,7 +160,7 @@ types, color the clusters with the palette batlowS.
 
 ### Scripts
 
-A skill can also bring JavaScript scripts, for what the tools of the chat cannot do, such as computing on the data. Its instructions say when to run which script, and with which arguments; the model runs it with _🧪 run_script_. The code of every script is shown in the chat before it runs, always open. While a script runs, a row shows for how long, and its _Stop_ button stops it; a script that runs longer than two minutes is stopped.
+A skill can also bring JavaScript scripts, for what the tools of the chat cannot do, such as computing on the data. Its instructions say when to run which script, and with which arguments; the model runs it with _🧪 run_script_. Every script is shown in the chat before it runs, as one line like those of the tools, e.g. _📜 cluster-sizes/scripts/cluster-sizes.js_: click it to read its code. While a script runs, a row shows for how long, and its _Stop_ button stops it; a script that runs longer than two minutes is stopped.
 
 A script is a JavaScript module whose default export is a function. It gets an object `tm`, and what it returns goes to the model, as text (objects and lists as JSON); what it logs with `console.log` goes along with it:
 
@@ -190,7 +190,7 @@ export default async function (tm) {
 
 Scripts run in a sandbox, which keeps them away from everything else: they can read the data through `tm`, but get only copies, so they cannot change the project; they cannot use the network, load other code, use `eval`, or reach the page, its storage or the API key. To change what is shown, the model uses its tools with what the script returned. Python scripts cannot run yet.
 
-The scripts of a skill that came with the project run only if you allow it: the first time one of them would run, the panel asks, and the code is already shown in the chat. Skills added by hand are yours, so their scripts run without asking.
+The scripts of a skill that came with the project run only if you allow it: the first time one of them would run, the panel opens its code in the chat and asks. Skills added by hand are yours, so their scripts run without asking.
 
 ## Limitations
 
