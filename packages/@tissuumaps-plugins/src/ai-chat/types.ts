@@ -90,6 +90,16 @@ export type ToolContext = {
     args: unknown,
     options?: { signal?: AbortSignal; progress?: (text: string) => void },
   ) => Promise<string>;
+  /**
+   * Runs code that the model wrote in the sandbox, and shows it in the chat
+   *
+   * @returns The result for the model
+   */
+  runCode: (
+    title: string,
+    code: string,
+    options?: { signal?: AbortSignal; progress?: (text: string) => void },
+  ) => Promise<string>;
 };
 
 /**

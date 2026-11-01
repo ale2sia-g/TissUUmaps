@@ -132,10 +132,23 @@ export const helpText = `How to use this chat
    itself. Before the scripts of a skill that came with the project run for the
    first time, their code opens and you are asked.
 
+12. Computing on the data
+   With OpenAI and Anthropic, the assistant can also answer questions that need
+   a computation, e.g. "how many cells are in each cluster?". It writes a short
+   JavaScript program and runs it in the same sandbox as the scripts of skills:
+   it can read the data, but cannot change the project, use the internet or see
+   your API key. No skill is needed: statistics, comparisons, correlations,
+   thresholds and spatial analyses with the coordinates of the cells all work.
+   It cannot yet read the pixels of images, draw charts or use libraries such
+   as scipy. The program is shown in the chat before it runs, as one line
+   (📜): click it to read the code. "Stop" stops it, and after two minutes it
+   stops by itself.
+
 What the assistant can do: answer questions about the open project, show or hide
 images, labels, points and shapes, make them more or less transparent, make
 points bigger or smaller, color labels and points by a column of their table
 (e.g. "color the cell labels by leiden", "cluster 3 in red, the others grey"),
 give them one color (e.g. "color the cell circles green"),
 and show only some groups (e.g. "show only clusters 1 and 3", then "show all the
-cells again"). It cannot change or delete anything else.`;
+cells again"). With OpenAI and Anthropic, it can also compute on the data (see
+12). It cannot change or delete anything else.`;

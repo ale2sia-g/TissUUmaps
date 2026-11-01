@@ -87,8 +87,9 @@ export const skillToolDefinitions = [
 export const skillInstructions = [
   "# Skills",
   "Skills are instructions, and sometimes files such as references or scripts, that the user",
-  "added for tasks you cannot do well on your own, e.g. the color conventions of their lab or",
-  "an analysis. Each turn lists the skills that are on, with their names and descriptions,",
+  "added for tasks they want done their way, e.g. the color conventions of their lab or the",
+  "method of an analysis. You need no skill to compute on the data: run_code does that (see",
+  "# Your own code). Each turn lists the skills that are on, with their names and descriptions,",
   "after the project summary. When a request matches the description of a skill, call",
   "load_skill with its name before you act or answer, then follow its instructions with your",
   "tools. Load a skill only when a request needs it, and only once in a conversation: its",

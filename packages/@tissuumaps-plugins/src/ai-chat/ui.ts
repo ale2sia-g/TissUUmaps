@@ -250,6 +250,7 @@ export const toolIcons: Record<string, string> = {
   load_skill: "📘",
   read_skill_file: "📄",
   run_script: "🧪",
+  run_code: "🧮",
 };
 
 /**

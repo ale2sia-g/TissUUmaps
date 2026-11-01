@@ -17,7 +17,8 @@ The assistant can:
 - make objects more or less transparent, and make points bigger or smaller;
 - color labels and points by a column of their table: groups get a color each (e.g. clusters or cell types), numbers a color scale (e.g. counts, or the expression of a gene such as `X[EPCAM]`), with the palette and value range you ask for;
 - give chosen colors to some groups (_"T cell in blue, the others grey"_), or one color to all items;
-- show only some groups of labels or points (_"show only clusters 1 and 3"_), and show all of them again.
+- show only some groups of labels or points (_"show only clusters 1 and 3"_), and show all of them again;
+- with OpenAI and Anthropic, compute on the data what the summary does not tell (_"how many cells are in each cluster?"_), with JavaScript it writes and runs in a sandbox (see [Computing on the data](#computing-on-the-data)).
 
 It cannot change or delete anything else, and it cannot filter by numbers (e.g. _"cells with an area above 50"_). It cannot zoom or move the view yet: use the mouse wheel to zoom, drag the image to move it, and click the button with the house at the top right of the viewer (_Reset view_) to see the whole image again.
 
@@ -129,7 +130,7 @@ See also [Ollama's FAQ](https://docs.ollama.com/faq) on `OLLAMA_ORIGINS`.
 
 ## Skills
 
-A skill gives the assistant instructions, and maybe scripts, for a task it cannot do on its own, such as an analysis. Skills use the [Agent Skills](https://agentskills.io/specification) format: a folder with a `SKILL.md` file, which starts with the skill's name and description, followed by its instructions. The folder may hold other files, such as scripts.
+A skill gives the assistant instructions, and maybe scripts, for a task you want done your way, such as the colors of your lab or the method of an analysis. Skills use the [Agent Skills](https://agentskills.io/specification) format: a folder with a `SKILL.md` file, which starts with the skill's name and description, followed by its instructions. The folder may hold other files, such as scripts.
 
 In the settings (⚙), _Add skill…_ adds the skills of a folder: choose the folder of one skill, or a folder with one folder per skill. The browser may ask whether to upload the files to the page: they stay on your computer. With _Remember this skill_, which is on by default, the browser keeps the skill for the next sessions, in every project, also in projects opened from a website; without it, the skill is kept until the page is closed. Each skill in the list can be turned off and on again, remembered or not (_Remember_), and removed. Click a description to read all of it, and again to fold it into one line.
 
@@ -192,6 +193,14 @@ Scripts run in a sandbox, which keeps them away from everything else: they can r
 
 The scripts of a skill that came with the project run only if you allow it: the first time one of them would run, the panel opens its code in the chat and asks. Skills added by hand are yours, so their scripts run without asking.
 
+## Computing on the data
+
+With OpenAI and Anthropic, the assistant can also answer questions that need a computation on the data, such as _"how many cells are in each cluster?"_ or _"what is the mean expression of EPCAM in cluster 3?"_. It writes a short JavaScript module for the question and runs it with _🧮 run_code_, in the same sandbox as the [scripts of skills](#scripts) and with the same `tm` (without `tm.args` and `tm.readFile`): the code can read the data, but cannot change the project, use the network or see your API key. No skill is needed: the assistant can compute statistics (counts, means, medians, quantiles, per group), compare groups, columns or genes, look for correlations, count what lies above a threshold, and do spatial analyses with the coordinates of the cells or points (distances, neighbors, density). If a skill that is on does the task, the assistant uses the skill, since it holds the method you want.
+
+It cannot yet read the pixels of images, draw charts, use libraries such as scipy or numpy, or run Python: it writes the statistics it needs itself, and gives the results as text. The code cannot add columns to the tables either; to show what it found, the assistant uses its tools, e.g. to show only some groups.
+
+The code is shown in the chat before it runs, as one line such as _📜 Dia's code: cells per cluster_: click it to read the code, and _Copy_ copies it. It runs without asking, like the scripts of the skills you added. While it runs, a row shows for how long, and its _Stop_ button stops it; code that runs longer than two minutes is stopped. The assistant answers from what the code returned, and says so if the code failed.
+
 ## Limitations
 
 - **Gene names**: genes can be named, as in `X[EPCAM]`, only if TissUUmaps could read the gene names from the index of `var/` of an AnnData table. Otherwise, the genes only have numbers (`X[0]`, `X[1]`, ...), and the project summary says that the gene names are not available.
@@ -236,6 +245,8 @@ The names, tones and avatars of Dia and Aid, and the words shown while the model
 The model sees the skills progressively, as the format intends: the names and descriptions of the skills that are on go with the context of each turn, between the project summary and the app state; the instructions of a skill come back as the result of the tool `load_skill(name)`, and its other files as the result of `read_skill_file(skill, path)` (text only, at most 50,000 characters). Both tools, and the rules for using skills, are always part of the tools and the fixed instructions of OpenAI and Anthropic, also without skills, so that the beginning of the requests stays the same for the prompt cache. They are in `skill-tools.ts`.
 
 The skills of the project are read in `project-skills.ts`, again whenever another project is opened or another folder is connected. The folder `skills` is found with `SourceUtils.normalizeSource("skills", workspace, source)`, like a project-relative data source: in the workspace, its files are listed (hidden ones left out, at most 1000); for a project opened from a URL, the files listed in `skills/index.json` are downloaded, and paths that leave the `skills` folder are refused. Without a `skills` folder or a `skills/index.json`, the project simply has no skills.
+
+The tool `run_code(title, code)` (in `code-tool.ts`) is offered, like the skills, only to OpenAI and Anthropic. The panel runs the code like a script of a skill, in the same sandbox and with the same time limit, but never asks first, since the code comes from the conversation with the user; the call is shown with its title only, since the code has its own row.
 
 Scripts run in `sandbox.ts`: each run gets a new iframe with `sandbox="allow-scripts"`, so that its origin is opaque and it cannot reach the page or its storage, and with the Content Security Policy `default-src 'none'; script-src 'unsafe-inline' blob:; worker-src blob:`, so that it has no network, no code from elsewhere and no `eval`. In it, a Web Worker, which inherits the policy, imports the script from a `blob:` URL and calls its default export. The worker keeps the page responsive, and removing the iframe stops it at any time: when the script ends, fails, takes longer than the time limit, or is stopped. The questions of `tm` travel to the panel through a `MessageChannel`, and the panel answers them with copies. The code of the worker and of the page of the sandbox are functions of `sandbox.ts`, sent as text, so they use nothing from outside themselves. The tests check the parts around the sandbox; what it blocks is checked in a browser with a script that tries to get out in about twenty ways (network, other code, storage, the page), all of which must fail.
 

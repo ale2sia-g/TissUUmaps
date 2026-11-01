@@ -1,6 +1,7 @@
 import type { PluginStores, ProjectStore } from "@tissuumaps/core";
 
 import { callActionDefinition, describeAction } from "./call-action";
+import { codeInstructions, runCodeDefinition } from "./code-tool";
 import { overlapWarning } from "./color-tools";
 import { helpText } from "./help";
 import {
@@ -1204,16 +1205,19 @@ export function mountAiChat(
    */
   function instructionsFor(provider: Provider): string {
     return provider.wholeApp
-      ? `${instructions.replace(toolLimits, actionLimits)}\n\n${wholeAppInstructions}\n\n${skillInstructions}`
+      ? `${instructions.replace(toolLimits, actionLimits)}\n\n${wholeAppInstructions}\n\n${skillInstructions}\n\n${codeInstructions}`
       : instructions;
   }
 
-  /** The tools for a service: for the strong models, also call_action and the skills */
+  /**
+   * The tools for a service: for the strong models, also call_action, the
+   * skills and run_code
+   */
   function toolsFor(provider: Provider) {
     return [
       ...toolDefinitions,
       ...(provider.wholeApp
-        ? [callActionDefinition, ...skillToolDefinitions]
+        ? [callActionDefinition, ...skillToolDefinitions, runCodeDefinition]
         : []),
     ].map((definition) => definition.function);
   }
@@ -1329,14 +1333,15 @@ export function mountAiChat(
    * that the script cannot change the data of the project
    *
    * @param question - What the script asks for, through tm
-   * @param skill - The skill of the script, for tm.readFile
+   * @param skill - The skill of the script, for tm.readFile; none for the
+   * code of the model
    * @param options - Optional abort signal
    * @returns The answer
    * @throws If the question cannot be answered, e.g. an unknown table
    */
   async function answerScript(
     question: ScriptQuestion,
-    skill: Skill,
+    skill: Skill | undefined,
     options?: { signal?: AbortSignal },
   ): Promise<unknown> {
     const { signal: stop } = options ?? {};
@@ -1347,6 +1352,11 @@ export function mountAiChat(
         .tables.map(({ id, name }) => ({ id, name }));
     }
     if (question.kind === "file") {
+      if (skill === undefined) {
+        throw new Error(
+          "tm.readFile reads the files of a skill, and this code is not part of one",
+        );
+      }
       const file = skill.files.get(question.path);
       if (file === undefined) {
         throw new Error(`the skill has no file "${question.path}"`);
@@ -1389,16 +1399,17 @@ export function mountAiChat(
   }
 
   /**
-   * Shows a script in the chat before it runs, as one row like those of the
-   * tools, e.g. "📜 counter/scripts/count.js", whose code opens with a click
+   * Shows a script or the code of the model in the chat before it runs, as
+   * one row like those of the tools, e.g. "📜 counter/scripts/count.js",
+   * whose code opens with a click
    *
-   * @param skill - The skill of the script
-   * @param path - The path of the script in the skill
+   * @param name - The name of the row, e.g. "📜 counter/scripts/count.js"
+   * @param tooltip - What the row is, when the pointer is on it
    * @param code - The code
    * @returns Opens the code and keeps it open, e.g. while the user is asked
    * whether the script may run
    */
-  function showScript(skill: Skill, path: string, code: string): () => void {
+  function showScript(name: string, tooltip: string, code: string): () => void {
     const message = document.createElement("div");
     message.dataset.who = "Script";
     message.style.cssText =
@@ -1409,8 +1420,8 @@ export function mountAiChat(
     const line = document.createElement("summary");
     line.style.cssText =
       "cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;";
-    line.textContent = `📜 ${skill.name}/${path}`;
-    line.title = `${path}, a JavaScript script of the skill "${skill.name}": click to read its code`;
+    line.textContent = name;
+    line.title = tooltip;
     const pre = document.createElement("pre");
     pre.dataset.details = "true";
     pre.textContent = code;
@@ -1454,11 +1465,15 @@ export function mountAiChat(
     args: unknown,
     options?: { signal?: AbortSignal; progress?: (text: string) => void },
   ): Promise<string> {
-    const { signal: stop, progress } = options ?? {};
+    const { signal: stop } = options ?? {};
     stop?.throwIfAborted();
     const code = (await skill.files.get(path)?.text()) ?? "";
     stop?.throwIfAborted();
-    const openCode = showScript(skill, path, code);
+    const openCode = showScript(
+      `📜 ${skill.name}/${path}`,
+      `${path}, a JavaScript script of the skill "${skill.name}": click to read its code`,
+      code,
+    );
     const from = skillList.projectSourceOf(skill);
     const key = `${projectStore.getState().instanceId}:${skill.name}`;
     if (from !== undefined && !allowedScripts.has(key)) {
@@ -1476,11 +1491,72 @@ export function mountAiChat(
       }
       allowedScripts.add(key);
     }
+    return runInSandbox(
+      code,
+      args,
+      skill,
+      { short: path, full: `${path} of the skill "${skill.name}"` },
+      options,
+    );
+  }
+
+  /**
+   * Runs code that the model wrote in the sandbox, after showing it
+   *
+   * @param title - What the code computes, in the words of the model
+   * @param code - The code
+   * @param options - Optional abort signal, which stops the code, and where
+   * to show the progress
+   * @returns The result for the model
+   * @throws If the code takes too long, or is stopped
+   */
+  async function runCode(
+    title: string,
+    code: string,
+    options?: { signal?: AbortSignal; progress?: (text: string) => void },
+  ): Promise<string> {
+    options?.signal?.throwIfAborted();
+    showScript(
+      `📜 ${persona.name}'s code: ${title}`,
+      `JavaScript that ${persona.name} wrote: click to read it`,
+      code,
+    );
+    return runInSandbox(
+      code,
+      {},
+      undefined,
+      { short: "the code", full: `the code "${title}"` },
+      options,
+    );
+  }
+
+  /**
+   * Runs a script or the code of the model in the sandbox, and shows how
+   * long it has been running
+   *
+   * @param code - The code: a module whose default export is a function of tm
+   * @param args - What the code gets as tm.args
+   * @param skill - The skill of a script, for tm.readFile
+   * @param names - The code in the progress row (e.g. "scripts/count.js"),
+   * and for the model (e.g. 'scripts/count.js of the skill "counter"')
+   * @param options - Optional abort signal, which stops the code, and where
+   * to show the progress
+   * @returns The result for the model
+   * @throws If the code takes too long, or is stopped
+   */
+  async function runInSandbox(
+    code: string,
+    args: unknown,
+    skill: Skill | undefined,
+    names: { short: string; full: string },
+    options?: { signal?: AbortSignal; progress?: (text: string) => void },
+  ): Promise<string> {
+    const { signal: stop, progress } = options ?? {};
     const started = Date.now();
     let reported = "";
     const update = () =>
       progress?.(
-        `running ${path}, ${Math.round((Date.now() - started) / 1000)} s${reported === "" ? "" : `: ${reported}`}`,
+        `running ${names.short}, ${Math.round((Date.now() - started) / 1000)} s${reported === "" ? "" : `: ${reported}`}`,
       );
     update();
     const ticker = setInterval(update, 1000);
@@ -1508,8 +1584,8 @@ export function mountAiChat(
         outcome.logs.length > 0 ? `\n\nLog:\n${outcome.logs.join("\n")}` : "";
       const text =
         outcome.error !== undefined
-          ? `Error: ${path} of the skill "${skill.name}" failed: ${outcome.error}${logs}`
-          : `Done: ran ${path} of the skill "${skill.name}" in ${seconds} s.\n\nResult:\n${outcome.result || "(nothing)"}${logs}`;
+          ? `Error: ${names.full} failed: ${outcome.error}${logs}`
+          : `Done: ran ${names.full} in ${seconds} s.\n\nResult:\n${outcome.result || "(nothing)"}${logs}`;
       return text.length > maxScriptText
         ? `${text.slice(0, maxScriptText)}\n\n(Cut: only the first ${maxScriptText} of ${text.length} characters.)`
         : text;
@@ -1578,6 +1654,7 @@ export function mountAiChat(
           skills: skillList.activeSkills(),
           progress,
           runSkillScript,
+          runCode,
         },
         { signal: stopper.signal },
       );
@@ -1699,7 +1776,10 @@ export function mountAiChat(
           const shownCall =
             name === "call_action"
               ? describeAction(projectStore.getState(), args)
-              : callText;
+              : name === "run_code"
+                ? // the code itself has its own row, just above
+                  describeCall(name, { title: args["title"] })
+                : callText;
           let outcome = {
             result: "Error: this exact call already failed.",
             warning: "",

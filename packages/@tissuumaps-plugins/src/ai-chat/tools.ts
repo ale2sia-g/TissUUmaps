@@ -1,4 +1,5 @@
 import { callAction } from "./call-action";
+import { runCodeTool } from "./code-tool";
 import {
   colorByColumn,
   setColor,
@@ -280,6 +281,7 @@ export const tools: Record<string, Tool> = {
   load_skill: loadSkill,
   read_skill_file: readSkillFile,
   run_script: runScriptTool,
+  run_code: runCodeTool,
 };
 
 /** The tools only offered to OpenAI and Anthropic, which know the whole app */
@@ -288,4 +290,5 @@ export const wholeAppTools = [
   "load_skill",
   "read_skill_file",
   "run_script",
+  "run_code",
 ];

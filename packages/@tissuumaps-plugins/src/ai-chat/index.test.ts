@@ -60,6 +60,9 @@ vi.mock("./sandbox", () => ({
       await answer({ kind: "values", table: "nope", column: "x" }).catch(
         (error: Error) => error.message,
       ),
+      await answer({ kind: "file", path: "scripts/count.js" }).catch(
+        (error: Error) => error.message,
+      ),
     ];
     sandbox.runs.push({ ...run, answers });
     options.onProgress?.("half way");
@@ -3283,7 +3286,7 @@ describe("aiChatPlugin", () => {
       expect(run?.project).toMatchObject({
         projectStore: { name: "xenium" },
       });
-      const [tables, columns, values, unknown] = run?.answers ?? [];
+      const [tables, columns, values, unknown, file] = run?.answers ?? [];
       expect(tables).toEqual([{ id: "tables/table", name: "table" }]);
       expect(columns).toContainEqual({ name: "obs/leiden", matrix: false });
       expect(columns).toContainEqual({ name: "X", matrix: true });
@@ -3291,6 +3294,7 @@ describe("aiChatPlugin", () => {
       expect(unknown).toBe(
         'there is no loaded table "nope"; tm.tables() lists the tables',
       );
+      expect(file).toBe(countScript);
     });
 
     it("copies an answer as the model wrote it, and the code of a script", async () => {
@@ -3452,6 +3456,54 @@ describe("aiChatPlugin", () => {
       );
     });
 
+    it("runs code that the model wrote in the sandbox, after showing it", async () => {
+      const confirm = vi.spyOn(window, "confirm");
+      const panel = await openPanel(undefined, undefined, {
+        provider: "anthropic",
+      });
+      await panel.pasteKey(anthropicKey);
+      services.answers = [
+        {
+          toolCalls: [
+            ["run_code", { title: "tables of the project", code: countScript }],
+          ],
+        },
+        { content: "There is 1 table." },
+      ];
+      await panel.say("How many tables are there?");
+      const request = JSON.stringify(services.requests.at(-1)?.body);
+      expect(request).toContain('"name":"run_code"');
+      expect(request).toContain("# Your own code");
+      // shown before it runs like the scripts of skills, and run without asking
+      expect(confirm).not.toHaveBeenCalled();
+      expect(scriptRows(panel.container)).toEqual([
+        { line: "📜 Dia's code: tables of the project", open: false },
+      ]);
+      expect(panel.texts("Script")).toEqual([countScript]);
+      // the code is not repeated in the row of the tool
+      expect(panel.texts("Tool")[0]).toMatch(
+        /^run_code\(title: tables of the project\)\n→ Done: ran the code "tables of the project" in \d+\.\d s\.\n\nResult:\n1 tables\n\nLog:\nhello from the script$/,
+      );
+      const [run] = sandbox.runs;
+      expect(run?.code).toBe(countScript);
+      expect(run?.args).toEqual({});
+      expect(run?.answers[4]).toBe(
+        "tm.readFile reads the files of a skill, and this code is not part of one",
+      );
+
+      sandbox.behavior = new Error("x is not defined");
+      services.answers = [
+        { toolCalls: [["run_code", { title: "no code" }]] },
+        { toolCalls: [["run_code", { title: "broken", code: "x" }]] },
+        { content: "It failed." },
+      ];
+      await panel.say("Try again.");
+      expect(panel.texts("Tool").slice(1)).toEqual([
+        "run_code(title: no code)\n→ Error: code is missing: give a JavaScript module, export default async function (tm) { ... }.",
+        "run_code(title: broken)\n→ Error: x is not defined",
+      ]);
+    });
+
     it("offers no skills to Ollama", async () => {
       const panel = await openPanel();
       await addSkills(panel.container, { "hello/SKILL.md": hello });
@@ -3460,6 +3512,7 @@ describe("aiChatPlugin", () => {
       const request = ollama.requests[0];
       expect(JSON.stringify(request?.tools)).not.toContain("load_skill");
       expect(JSON.stringify(request?.tools)).not.toContain("run_script");
+      expect(JSON.stringify(request?.tools)).not.toContain("run_code");
       expect(request?.messages[0]?.content).not.toContain("# Skills");
       expect(panel.texts("Tool")[0]).toContain(
         'Error: there is no tool called "load_skill".',
