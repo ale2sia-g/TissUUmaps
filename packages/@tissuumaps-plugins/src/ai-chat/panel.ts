@@ -345,8 +345,22 @@ export function mountAiChat(
   bottomRow.append(input, sendButton);
 
   const footer = document.createElement("div");
-  footer.textContent = credits;
   footer.style.cssText = `${quietTextStyle}font-size: 11px; text-align: right;`;
+  const creditsLink = document.createElement("a");
+  creditsLink.textContent = credits.text;
+  creditsLink.href = credits.url;
+  creditsLink.target = "_blank";
+  creditsLink.rel = "noopener noreferrer";
+  creditsLink.title = "View on GitHub";
+  creditsLink.style.cssText = "color: inherit; text-decoration: none;";
+  // underlined only under the pointer, so that it stays quiet
+  creditsLink.addEventListener("mouseenter", () => {
+    creditsLink.style.textDecoration = "underline";
+  });
+  creditsLink.addEventListener("mouseleave", () => {
+    creditsLink.style.textDecoration = "none";
+  });
+  footer.append(creditsLink);
 
   // shown under a part of an answer that the user selects
   const quoteButton = makeButton("Quote", quoteSelection, smallButtonStyle);

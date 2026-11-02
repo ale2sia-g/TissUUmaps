@@ -38,8 +38,11 @@ export const messageStyles: Record<MessageKind, string> = {
 /** How long each word is shown while the model thinks, in milliseconds */
 const thinkingWordTime = 2000;
 
-/** The line at the bottom of the panel */
-export const credits = "Made by Alessia Giustolisi";
+/** The line at the bottom of the panel, which links to the author */
+export const credits = {
+  text: "Made by Alessia Giustolisi",
+  url: "https://github.com/ale2sia-g",
+};
 
 /**
  * Creates a button

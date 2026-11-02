@@ -2640,11 +2640,15 @@ describe("aiChatPlugin", () => {
       );
     });
 
-    it("says who made it", async () => {
+    it("says who made it, with a link to the GitHub page of the author", async () => {
       const panel = await openPanel();
-      expect(panel.container.textContent).toContain(
-        "Made by Alessia Giustolisi",
+      const link = [...panel.container.querySelectorAll("a")].find(
+        (a) => a.textContent === "Made by Alessia Giustolisi",
       );
+      expect(link?.href).toBe("https://github.com/ale2sia-g");
+      expect(link?.title).toBe("View on GitHub");
+      expect(link?.target).toBe("_blank");
+      expect(link?.rel).toBe("noopener noreferrer");
     });
   });
 

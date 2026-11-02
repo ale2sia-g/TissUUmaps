@@ -252,4 +252,4 @@ Scripts run in `sandbox.ts`: each run gets a new iframe with `sandbox="allow-scr
 
 ---
 
-_Made by Alessia Giustolisi_
+_Made by [Alessia Giustolisi](https://github.com/ale2sia-g)_
