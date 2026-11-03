@@ -83,6 +83,108 @@ vi.mock("./sandbox", () => ({
   },
 }));
 
+/**
+ * The fake Python: Pyodide does not run in jsdom, and what the real sandbox
+ * blocks is checked in a browser. Its kernel asks the panel what code would
+ * ask, and gives back a chosen outcome.
+ */
+const python = vi.hoisted(() => {
+  const state: {
+    /** How many kernels were started, and stopped */
+    starts: number;
+    stops: number;
+    /** The code that ran, with the answers of the panel */
+    runs: (ScriptRun & { answers: unknown[] })[];
+    /** "done", an error the kernel throws, or "hang" until stopped */
+    behavior: "done" | "hang" | Error;
+    /** Whether starting waits until it is stopped, as a long download */
+    startHangs: boolean;
+    /** The files of Python that the browser keeps */
+    files: number;
+    onDownload?: (progress?: { done: number; total: number }) => void;
+  } = {
+    starts: 0,
+    stops: 0,
+    runs: [],
+    behavior: "done",
+    startHangs: false,
+    files: 0,
+  };
+  return state;
+});
+const untilAborted = (signal?: AbortSignal) =>
+  new Promise<never>((_resolve, reject) =>
+    signal?.addEventListener("abort", () => reject(signal.reason as Error)),
+  );
+vi.mock("./python-files", () => ({
+  makePythonFiles: (
+    onDownload: (progress?: { done: number; total: number }) => void,
+  ) => {
+    python.onDownload = onDownload;
+    return { get: () => Promise.reject(new Error("no files in the tests")) };
+  },
+  countPythonFiles: () => Promise.resolve(python.files),
+  forgetPythonFiles: () => {
+    const forgotten = python.files;
+    python.files = 0;
+    return Promise.resolve(forgotten);
+  },
+}));
+vi.mock("./python-sandbox", () => ({
+  startPythonKernel: async (
+    _files: unknown,
+    options?: { signal?: AbortSignal },
+  ) => {
+    python.starts++;
+    python.onDownload?.({ done: 12e6, total: 37e6 });
+    if (python.startHangs) {
+      await untilAborted(options?.signal).finally(() =>
+        python.onDownload?.(undefined),
+      );
+    }
+    python.onDownload?.(undefined);
+    let stopped = false;
+    const stop = () => {
+      stopped = true;
+      python.stops++;
+    };
+    return {
+      isStopped: () => stopped,
+      stop,
+      run: async (
+        run: ScriptRun,
+        answer: (question: ScriptQuestion) => Promise<unknown>,
+        options: {
+          signal?: AbortSignal;
+          onProgress?: (text: string) => void;
+          onRunning?: () => void;
+        },
+      ) => {
+        const answers = [
+          await answer({ kind: "tables" }),
+          await answer({ kind: "file", path: "data.csv" }).catch(
+            (error: Error) => error.message,
+          ),
+        ];
+        python.runs.push({ ...run, answers });
+        options.onRunning?.();
+        options.onProgress?.("half way");
+        if (python.behavior === "hang") {
+          await untilAborted(options.signal).finally(stop);
+        }
+        if (python.behavior instanceof Error) {
+          stop();
+          throw python.behavior;
+        }
+        return {
+          result: `${(answers[0] as unknown[]).length} tables`,
+          logs: ["hello from Python"],
+        };
+      },
+    };
+  },
+}));
+
 /** The ids of the objects of the fake project */
 const cellLabels = "labels/cell_labels@global";
 const nucleusLabels = "labels/nucleus_labels@global";
@@ -3231,7 +3333,22 @@ describe("aiChatPlugin", () => {
     beforeEach(() => {
       sandbox.runs.length = 0;
       sandbox.behavior = "done";
+      Object.assign(python, {
+        starts: 0,
+        stops: 0,
+        runs: [],
+        behavior: "done",
+        startHangs: false,
+        files: 0,
+      });
     });
+
+    /** A call of run_code in Python */
+    const pythonCode = "async def main(tm):\n    return len(await tm.tables())";
+    const runPython = (title = "tables"): [string, Record<string, unknown>] => [
+      "run_code",
+      { title, language: "python", code: pythonCode },
+    ];
 
     it("uses the skills next to the project file in the connected folder", async () => {
       const panel = await openPanel(undefined, undefined, {
@@ -3492,7 +3609,7 @@ describe("aiChatPlugin", () => {
       expect(run?.code).toBe(countScript);
       expect(run?.args).toEqual({});
       expect(run?.answers[4]).toBe(
-        "tm.readFile reads the files of a skill, and this code is not part of one",
+        "only the scripts of skills have files to read, and this code is not part of a skill",
       );
 
       sandbox.behavior = new Error("x is not defined");
@@ -3506,6 +3623,133 @@ describe("aiChatPlugin", () => {
         "run_code(title: no code)\n→ Error: code is missing: give a JavaScript module, export default async function (tm) { ... }.",
         "run_code(title: broken)\n→ Error: x is not defined",
       ]);
+    });
+
+    it("runs Python that the model wrote, in one Python for the whole chat", async () => {
+      const panel = await openPanel(undefined, undefined, {
+        provider: "anthropic",
+      });
+      await panel.pasteKey(anthropicKey);
+      services.answers = [
+        { toolCalls: [runPython()] },
+        { content: "There is 1 table." },
+      ];
+      await panel.say("How many tables are there? Use Python.");
+      const request = JSON.stringify(services.requests.at(-1)?.body);
+      expect(request).toContain('"enum":["javascript","python"]');
+      expect(request).toContain("JavaScript or Python:");
+      expect(scriptRows(panel.container)).toEqual([
+        { line: "📜 Dia's code: tables (Python)", open: false },
+      ]);
+      expect(panel.texts("Script")).toEqual([pythonCode]);
+      expect(panel.texts("Tool")[0]).toMatch(
+        /^run_code\(title: tables, language: python\)\n→ Done: ran the code "tables" in \d+\.\d s\.\n\nResult:\n1 tables\n\nLog:\nhello from Python$/,
+      );
+      const [run] = python.runs;
+      expect(run?.code).toBe(pythonCode);
+      expect(run?.args).toEqual({});
+      expect(run?.project).toMatchObject({ projectStore: { name: "xenium" } });
+      expect(run?.answers).toEqual([
+        [{ id: "tables/table", name: "table" }],
+        "only the scripts of skills have files to read, and this code is not part of a skill",
+      ]);
+      // JavaScript does not need Python
+      expect(sandbox.runs).toHaveLength(0);
+
+      // the same Python for the next code of the chat
+      services.answers = [
+        { toolCalls: [runPython()] },
+        { content: "Still 1." },
+      ];
+      await panel.say("And now?");
+      expect([python.starts, python.stops]).toEqual([1, 0]);
+
+      // a new one after New chat, and after another project is opened
+      vi.spyOn(window, "confirm").mockReturnValue(true);
+      panel.button("New chat").click();
+      expect(python.stops).toBe(1);
+      services.answers = [{ toolCalls: [runPython()] }, { content: "1." }];
+      await panel.say("Count again.");
+      expect(python.starts).toBe(2);
+      panel.projectStore.openOtherProject({ name: "other" });
+      expect(python.stops).toBe(2);
+    });
+
+    it("shows the download of Python with a Stop button, and starts again after a stop", async () => {
+      const panel = await openPanel(undefined, undefined, {
+        provider: "anthropic",
+      });
+      await panel.pasteKey(anthropicKey);
+      python.startHangs = true;
+      services.answers = [
+        { toolCalls: [runPython()] },
+        { content: "It was stopped." },
+      ];
+      (panel.container.querySelector("textarea") as HTMLTextAreaElement).value =
+        "Count the tables with Python.";
+      panel.button("Send").click();
+      await vi.waitFor(() =>
+        expect(panel.container.textContent).toContain(
+          "… Downloading Python, 12 of 37 MB",
+        ),
+      );
+      panel.button("Stop").click();
+      await vi.waitFor(() =>
+        expect(panel.button("Send").textContent).toBe("Send"),
+      );
+      expect(panel.texts("Tool")[0]).toContain(
+        "Stopped by the user before the end.",
+      );
+      expect(python.runs).toHaveLength(0);
+
+      // a run that is stopped, or takes too long, stops Python too
+      python.startHangs = false;
+      python.behavior = new Error(
+        "the script took longer than 120 seconds, and was stopped",
+      );
+      services.answers = [
+        { toolCalls: [runPython()] },
+        { toolCalls: [runPython("again")] },
+        { content: "Too long." },
+      ];
+      await panel.say("Try again.");
+      expect(panel.texts("Tool").slice(1)).toEqual([
+        "run_code(title: tables, language: python)\n→ Error: the script took longer than 120 seconds, and was stopped",
+        "run_code(title: again, language: python)\n→ Error: the script took longer than 120 seconds, and was stopped",
+      ]);
+      expect(python.starts).toBe(3);
+
+      services.answers = [
+        {
+          toolCalls: [
+            ["run_code", { title: "x", language: "ruby", code: "1" }],
+          ],
+        },
+        { content: "No Ruby." },
+      ];
+      await panel.say("Use Ruby.");
+      expect(panel.texts("Tool").at(-1)).toContain(
+        'Error: run_code runs "javascript" or "python", not "ruby".',
+      );
+    });
+
+    it("tells how many files of Python the browser keeps, and forgets them", async () => {
+      python.files = 26;
+      const panel = await openPanel();
+      await vi.waitFor(() =>
+        expect(panel.container.textContent).toContain(
+          "Python: 26 files kept in this browser",
+        ),
+      );
+      const forget = panel.button("Forget Python files");
+      expect(forget.disabled).toBe(false);
+      forget.click();
+      await vi.waitFor(() =>
+        expect(panel.container.textContent).toContain(
+          "Python: 26 files forgotten; they are downloaded again when Python is needed",
+        ),
+      );
+      expect(forget.disabled).toBe(true);
     });
 
     it("offers no skills to Ollama", async () => {

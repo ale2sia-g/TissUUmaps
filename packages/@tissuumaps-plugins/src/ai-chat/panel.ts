@@ -28,7 +28,14 @@ import {
   providers,
   readJsonLines,
 } from "./providers";
-import { type ScriptQuestion, runScript } from "./sandbox";
+import {
+  type DownloadProgress,
+  countPythonFiles,
+  forgetPythonFiles,
+  makePythonFiles,
+} from "./python-files";
+import { type PythonKernel, startPythonKernel } from "./python-sandbox";
+import { type ScriptOutcome, type ScriptQuestion, runScript } from "./sandbox";
 import { loadSetting, saveSetting } from "./settings";
 import { makeSkillList } from "./skill-list";
 import {
@@ -277,6 +284,57 @@ export function mountAiChat(
   );
   /** The skills of the project whose scripts the user allowed, by project and name */
   const allowedScripts = new Set<string>();
+
+  /** The download of the files of Python in progress, if any */
+  let pythonDownload: DownloadProgress | undefined;
+  /** Shows the download, in the row of the tool that waits for Python */
+  let showPythonDownload: (() => void) | null = null;
+  const pythonFiles = makePythonFiles((progress) => {
+    pythonDownload = progress;
+    showPythonDownload?.();
+  });
+  /**
+   * Python, kept for the next runs of this chat, and where the code that it
+   * runs comes from: code from elsewhere gets a new one
+   */
+  let pythonKernel: { kernel: PythonKernel; source: string } | null = null;
+
+  /** Stops Python: the next Python code starts it again */
+  function stopPython(): void {
+    pythonKernel?.kernel.stop();
+    pythonKernel = null;
+  }
+
+  const pythonFilesInfo = document.createElement("span");
+  pythonFilesInfo.style.cssText = quietTextStyle;
+  const forgetPythonButton = makeButton(
+    "Forget Python files",
+    () => void forgetPython(),
+    smallButtonStyle,
+  );
+  forgetPythonButton.title =
+    "Remove the files of Python that this browser keeps; they are downloaded again when Python is needed";
+  const pythonRow = document.createElement("div");
+  pythonRow.style.cssText =
+    "display: flex; flex-wrap: wrap; gap: 8px; align-items: center;";
+  pythonRow.append(pythonFilesInfo, forgetPythonButton);
+
+  /** Shows how many files of Python this browser keeps */
+  async function updatePythonFiles(): Promise<void> {
+    const count = await countPythonFiles();
+    pythonFilesInfo.textContent =
+      count === 0
+        ? "Python: no files downloaded"
+        : `Python: ${count} files kept in this browser`;
+    forgetPythonButton.disabled = count === 0;
+  }
+
+  /** Forgets the files of Python that this browser keeps */
+  async function forgetPython(): Promise<void> {
+    const count = await forgetPythonFiles();
+    pythonFilesInfo.textContent = `Python: ${count} files forgotten; they are downloaded again when Python is needed`;
+    forgetPythonButton.disabled = true;
+  }
   /** The project and workspace whose skills were read last */
   let skillsRead: { instanceId: string; workspace: unknown } | null = null;
 
@@ -320,6 +378,7 @@ export function mountAiChat(
     statusRow,
     toolDetailsLabel,
     skillList.element,
+    pythonRow,
   );
 
   const history = document.createElement("div");
@@ -744,6 +803,8 @@ export function mountAiChat(
     history.replaceChildren();
     toolRows.length = 0;
     updateExamples();
+    // a new chat gets a new Python
+    stopPython();
   }
 
   /** Enables "Undo" and "Undo all" when there is something to undo and the model is not working */
@@ -880,6 +941,8 @@ export function mountAiChat(
     if (state.instanceId === previousState.instanceId) {
       return;
     }
+    // Python may hold data of the other project
+    stopPython();
     tables.info.clear();
     tables.remembered.clear();
     readTables();
@@ -1368,7 +1431,7 @@ export function mountAiChat(
     if (question.kind === "file") {
       if (skill === undefined) {
         throw new Error(
-          "tm.readFile reads the files of a skill, and this code is not part of one",
+          "only the scripts of skills have files to read, and this code is not part of a skill",
         );
       }
       const file = skill.files.get(question.path);
@@ -1519,6 +1582,7 @@ export function mountAiChat(
    *
    * @param title - What the code computes, in the words of the model
    * @param code - The code
+   * @param language - JavaScript, or Python
    * @param options - Optional abort signal, which stops the code, and where
    * to show the progress
    * @returns The result for the model
@@ -1527,21 +1591,132 @@ export function mountAiChat(
   async function runCode(
     title: string,
     code: string,
+    language: "javascript" | "python",
     options?: { signal?: AbortSignal; progress?: (text: string) => void },
   ): Promise<string> {
     options?.signal?.throwIfAborted();
+    const python = language === "python";
     showScript(
-      `📜 ${persona.name}'s code: ${title}`,
-      `JavaScript that ${persona.name} wrote: click to read it`,
+      `📜 ${persona.name}'s code: ${title}${python ? " (Python)" : ""}`,
+      `${python ? "Python" : "JavaScript"} that ${persona.name} wrote: click to read it`,
       code,
     );
-    return runInSandbox(
-      code,
-      {},
-      undefined,
-      { short: "the code", full: `the code "${title}"` },
-      options,
-    );
+    const names = { short: "the code", full: `the code "${title}"` };
+    return python
+      ? runInPython(code, {}, undefined, names, "chat", options)
+      : runInSandbox(code, {}, undefined, names, options);
+  }
+
+  /**
+   * The result of a script or of the code of the model, for the model
+   *
+   * @param outcome - What the sandbox gave back
+   * @param name - The code, for the model (e.g. 'the code "cells per cluster"')
+   * @param started - When the code started to run, in milliseconds
+   * @returns The text, cut if it is too long
+   */
+  function scriptResult(
+    outcome: ScriptOutcome,
+    name: string,
+    started: number,
+  ): string {
+    const seconds = ((Date.now() - started) / 1000).toFixed(1);
+    const logs =
+      outcome.logs.length > 0 ? `\n\nLog:\n${outcome.logs.join("\n")}` : "";
+    const text =
+      outcome.error !== undefined
+        ? `Error: ${name} failed: ${outcome.error}${logs}`
+        : `Done: ran ${name} in ${seconds} s.\n\nResult:\n${outcome.result || "(nothing)"}${logs}`;
+    return text.length > maxScriptText
+      ? `${text.slice(0, maxScriptText)}\n\n(Cut: only the first ${maxScriptText} of ${text.length} characters.)`
+      : text;
+  }
+
+  /**
+   * Runs Python code: starts Python first if needed, which may download its
+   * files, and loads the packages that the code imports. Neither counts for
+   * the time limit.
+   *
+   * @param code - The code, with a function main(tm)
+   * @param args - What the code gets as tm.args
+   * @param skill - The skill of a script, for tm.read_file
+   * @param names - The code in the progress row, and for the model
+   * @param source - Where the code comes from, e.g. "chat": code from
+   * elsewhere gets a new Python, so that it cannot change what the code
+   * from here uses
+   * @param options - Optional abort signal, which stops the code, and where
+   * to show the progress
+   * @returns The result for the model
+   * @throws If the code takes too long, or is stopped
+   */
+  async function runInPython(
+    code: string,
+    args: unknown,
+    skill: Skill | undefined,
+    names: { short: string; full: string },
+    source: string,
+    options?: { signal?: AbortSignal; progress?: (text: string) => void },
+  ): Promise<string> {
+    const { signal: stop, progress } = options ?? {};
+    let step = "starting Python";
+    let started: number | undefined;
+    let reported = "";
+    // e.g. "0.4" or "12"
+    const megabytes = (bytes: number) =>
+      bytes < 10e6 ? (bytes / 1e6).toFixed(1) : Math.round(bytes / 1e6);
+    const update = () =>
+      progress?.(
+        pythonDownload !== undefined
+          ? `Downloading Python, ${megabytes(pythonDownload.done)} of ${megabytes(pythonDownload.total)} MB`
+          : started === undefined
+            ? step
+            : `running ${names.short}, ${Math.round((Date.now() - started) / 1000)} s${reported === "" ? "" : `: ${reported}`}`,
+      );
+    showPythonDownload = update;
+    update();
+    const ticker = setInterval(update, 1000);
+    try {
+      if (
+        pythonKernel === null ||
+        pythonKernel.kernel.isStopped() ||
+        pythonKernel.source !== source
+      ) {
+        stopPython();
+        pythonKernel = {
+          kernel: await startPythonKernel(pythonFiles, { signal: stop }),
+          source,
+        };
+      }
+      step = "loading the Python packages";
+      update();
+      const outcome = await pythonKernel.kernel.run(
+        {
+          code,
+          args,
+          project: JSON.parse(
+            stateJson(projectStore.getState(), appStore.getState()),
+          ) as unknown,
+        },
+        (question) => answerScript(question, skill, { signal: stop }),
+        {
+          timeLimit: scriptTimeLimit,
+          signal: stop,
+          onProgress: (text) => {
+            reported = text;
+            update();
+          },
+          onRunning: () => {
+            started = Date.now();
+            update();
+          },
+        },
+      );
+      return scriptResult(outcome, names.full, started ?? Date.now());
+    } finally {
+      clearInterval(ticker);
+      showPythonDownload = null;
+      void updatePythonFiles();
+    }
   }
 
   /**
@@ -1593,16 +1768,7 @@ export function mountAiChat(
           },
         },
       );
-      const seconds = ((Date.now() - started) / 1000).toFixed(1);
-      const logs =
-        outcome.logs.length > 0 ? `\n\nLog:\n${outcome.logs.join("\n")}` : "";
-      const text =
-        outcome.error !== undefined
-          ? `Error: ${names.full} failed: ${outcome.error}${logs}`
-          : `Done: ran ${names.full} in ${seconds} s.\n\nResult:\n${outcome.result || "(nothing)"}${logs}`;
-      return text.length > maxScriptText
-        ? `${text.slice(0, maxScriptText)}\n\n(Cut: only the first ${maxScriptText} of ${text.length} characters.)`
-        : text;
+      return scriptResult(outcome, names.full, started);
     } finally {
       clearInterval(ticker);
     }
@@ -1792,7 +1958,12 @@ export function mountAiChat(
               ? describeAction(projectStore.getState(), args)
               : name === "run_code"
                 ? // the code itself has its own row, just above
-                  describeCall(name, { title: args["title"] })
+                  describeCall(name, {
+                    title: args["title"],
+                    ...(args["language"] === undefined
+                      ? {}
+                      : { language: args["language"] }),
+                  })
                 : callText;
           let outcome = {
             result: "Error: this exact call already failed.",
@@ -1934,11 +2105,13 @@ export function mountAiChat(
   fillModelMenu();
   updateStatus();
   void check();
+  void updatePythonFiles();
   updateUndoButtons();
   updateExamples();
 
   return () => {
     abortController.abort();
+    stopPython();
     stopThinking();
     observer.disconnect();
     unsubscribeData();

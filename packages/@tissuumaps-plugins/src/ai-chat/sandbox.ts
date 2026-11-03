@@ -6,7 +6,8 @@
 // and can be stopped at any time, by removing the iframe. The script gets
 // only what the panel sends it: its arguments, a copy of the project state,
 // and the data it asks for through the object `tm`, which the panel answers
-// with copies.
+// with copies. Python uses the same page, with its own worker and policy
+// (see python-sandbox.ts).
 
 /** What a script asks the panel for, through `tm` */
 export type ScriptQuestion =
@@ -180,12 +181,19 @@ function sandboxMain(workerSource: string): void {
 /**
  * The HTML of the sandbox page
  *
+ * @param options - Another worker and policy than those of JavaScript, e.g.
+ * those of Python; the worker gets the script and a port to the panel when
+ * the panel sends them
  * @returns The page, for the srcdoc of the iframe
  */
-export function sandboxPage(): string {
+export function sandboxPage(options?: {
+  worker: (load: (url: string) => Promise<unknown>) => void;
+  policy: string;
+}): string {
+  const { worker = workerMain, policy = contentSecurityPolicy } = options ?? {};
   // import() written as text: in development, Vite rewrites an import() of a
   // variable in the code it serves, with a function the sandbox does not have
-  const workerSource = `(${workerMain.toString()})((url) => import(url));`;
+  const workerSource = `(${worker.toString()})((url) => import(url));`;
   // "<" escaped, so that nothing in the code can end the script element
   const source = JSON.stringify(workerSource).replaceAll("<", "\\x3c");
   // the closing tag in two pieces: the app is built into one HTML file, with
@@ -193,7 +201,7 @@ export function sandboxPage(): string {
   const endScript = "</" + "script>";
   return (
     '<!doctype html><meta charset="utf-8">' +
-    `<meta http-equiv="Content-Security-Policy" content="${contentSecurityPolicy}">` +
+    `<meta http-equiv="Content-Security-Policy" content="${policy}">` +
     `<script>(${sandboxMain.toString()})(${source});${endScript}`
   );
 }

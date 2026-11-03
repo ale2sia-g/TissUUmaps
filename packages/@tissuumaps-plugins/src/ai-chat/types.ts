@@ -98,6 +98,7 @@ export type ToolContext = {
   runCode: (
     title: string,
     code: string,
+    language: "javascript" | "python",
     options?: { signal?: AbortSignal; progress?: (text: string) => void },
   ) => Promise<string>;
 };

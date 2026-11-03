@@ -1,0 +1,563 @@
+import { type PythonFiles, coreFiles, lockFile } from "./python-files";
+import {
+  type ScriptOutcome,
+  type ScriptQuestion,
+  type ScriptRun,
+  sandboxPage,
+} from "./sandbox";
+
+// Python runs in Pyodide, in a sandbox like that of JavaScript: an iframe
+// with sandbox="allow-scripts" and a Content Security Policy without any
+// network, with a Web Worker in it. The policy also allows WebAssembly, which
+// Pyodide is made of, but still no eval. The worker never downloads anything:
+// the panel gives it the files of Pyodide (see python-files.ts), and while
+// Pyodide loads itself or a package, its fetch asks the panel for them, and
+// can get nothing else. Starting Python takes seconds, so the sandbox stays,
+// as a "kernel", for the next runs, each with fresh names; it is removed to
+// stop a run.
+
+/** No network, no eval; WebAssembly may be compiled, which Pyodide needs */
+const contentSecurityPolicy =
+  "default-src 'none'; script-src 'unsafe-inline' blob: 'wasm-unsafe-eval'; worker-src blob:";
+
+/**
+ * The Python side of the sandbox: runs the code of a script with fresh
+ * names, and gives it tm, like tm of JavaScript but with numpy arrays
+ */
+const driver = [
+  "import inspect",
+  "import json",
+  "import os",
+  "import sys",
+  "",
+  "import js",
+  "from pyodide.ffi import to_js",
+  "",
+  "# figures are drawn into images, never into a window",
+  'os.environ["MPLBACKEND"] = "Agg"',
+  "",
+  "",
+  "class _Tm:",
+  '    """What a script gets: the data of the project, always as copies"""',
+  "",
+  "    def __init__(self, ask, progress, args, project):",
+  "        self._ask = ask",
+  "        self._progress = progress",
+  "        self.args = args",
+  "        self.project = project",
+  "",
+  "    async def _question(self, **question):",
+  "        return await self._ask(to_js(question, dict_converter=js.Object.fromEntries))",
+  "",
+  "    async def tables(self):",
+  '        return (await self._question(kind="tables")).to_py()',
+  "",
+  "    async def columns(self, table, matrix=None):",
+  '        question = {"kind": "columns", "table": table}',
+  "        if matrix is not None:",
+  '            question["matrix"] = matrix',
+  "        return (await self._question(**question)).to_py()",
+  "",
+  "    async def read(self, table, column):",
+  "        import numpy as np",
+  "",
+  '        values = await self._question(kind="values", table=table, column=column)',
+  "        if js.ArrayBuffer.isView(values):",
+  "            return np.asarray(values.to_py())",
+  "        return np.asarray(values.to_py(), dtype=object)",
+  "",
+  "    async def read_file(self, path):",
+  '        return await self._question(kind="file", path=path)',
+  "",
+  "    def progress(self, text):",
+  "        self._progress(str(text))",
+  "",
+  "",
+  "def _text(value):",
+  "    if value is None:",
+  '        return ""',
+  "    if isinstance(value, str):",
+  "        return value",
+  '    pandas = sys.modules.get("pandas")',
+  "    if pandas is not None and isinstance(value, (pandas.DataFrame, pandas.Series)):",
+  "        return value.to_string()",
+  '    if hasattr(value, "tolist"):',
+  "        value = value.tolist()",
+  "    return json.dumps(",
+  '        value, indent=2, default=lambda item: item.tolist() if hasattr(item, "tolist") else str(item)',
+  "    )",
+  "",
+  "",
+  "async def _run(code, ask, progress, args, project, skill_dir):",
+  "    if skill_dir and skill_dir not in sys.path:",
+  "        sys.path.insert(0, skill_dir)",
+  '    namespace = {"__name__": "__script__"}',
+  '    exec(compile(code, "<script>", "exec"), namespace)',
+  '    main = namespace.get("main")',
+  "    if not callable(main):",
+  "        raise ValueError(",
+  '            "the script must define a function main(tm), e.g. async def main(tm): ..."',
+  "        )",
+  "    result = main(_Tm(ask, progress, json.loads(args), json.loads(project)))",
+  "    if inspect.isawaitable(result):",
+  "        result = await result",
+  "    return _text(result)",
+].join("\n");
+
+/** What the worker needs of Pyodide */
+type Pyodide = {
+  runPython: (code: string) => unknown;
+  loadPackagesFromImports: (
+    code: string,
+    options: {
+      messageCallback: (message: string) => void;
+      errorCallback: (message: string) => void;
+    },
+  ) => Promise<unknown>;
+  setStdout: (options: { batched: (line: string) => void }) => void;
+  setStderr: (options: { batched: (line: string) => void }) => void;
+  globals: {
+    get: (name: string) => ((...args: unknown[]) => Promise<string>) & {
+      destroy: () => void;
+    };
+  };
+  FS: {
+    mkdirTree: (path: string) => void;
+    writeFile: (path: string, data: Uint8Array) => void;
+  };
+};
+
+/** What the panel sends to the worker */
+type ToWorker =
+  | { type: "answer"; id: number; value?: unknown; error?: string }
+  | {
+      type: "start";
+      id: number;
+      files: Record<string, ArrayBuffer>;
+      lock: string;
+      driver: string;
+    }
+  | {
+      type: "run";
+      id: number;
+      run: ScriptRun & { files?: Record<string, ArrayBuffer> };
+    };
+
+/** What the worker sends to the panel */
+type FromWorker =
+  | { type: "file"; id: number; name: string }
+  | { type: "question"; id: number; question: ScriptQuestion }
+  | { type: "progress"; text: string }
+  | { type: "running"; id: number }
+  | { type: "done"; id: number; value?: ScriptOutcome }
+  | { type: "failed"; id: number; error: string };
+
+/**
+ * The Web Worker that runs Python; it is sent to the sandbox as text, so it
+ * must use nothing from outside itself
+ *
+ * @param load - Imports a module from its URL
+ */
+function workerMain(load: (url: string) => Promise<unknown>): void {
+  // a made-up address: Pyodide asks for its files there, and gets them from
+  // memory or from the panel
+  const base = "https://pyodide.invalid/";
+  const realFetch = self.fetch.bind(self);
+  const files = new Map<string, ArrayBuffer>();
+  const pending = new Map<
+    number,
+    { resolve: (value: unknown) => void; reject: (error: Error) => void }
+  >();
+  let nextId = 0;
+  let port: MessagePort;
+  let pyodide: Pyodide;
+
+  const ask = (message: { type: string } & Record<string, unknown>) =>
+    new Promise<unknown>((resolve, reject) => {
+      const id = nextId++;
+      pending.set(id, { resolve, reject });
+      port.postMessage({ ...message, id });
+    });
+
+  // only while Pyodide loads itself or packages, never while a script runs
+  const servePyodideFiles = (on: boolean) => {
+    self.fetch = on
+      ? async (url: RequestInfo | URL) => {
+          const address =
+            url instanceof Request
+              ? url.url
+              : url instanceof URL
+                ? url.href
+                : url;
+          if (!address.startsWith(base)) {
+            throw new TypeError(`Python has no network: ${address}`);
+          }
+          const name = address.slice(base.length);
+          if (!files.has(name)) {
+            files.set(name, (await ask({ type: "file", name })) as ArrayBuffer);
+          }
+          return new Response(files.get(name)!.slice(0), {
+            headers: {
+              "Content-Type": name.endsWith(".wasm")
+                ? "application/wasm"
+                : "application/octet-stream",
+            },
+          });
+        }
+      : realFetch;
+  };
+
+  const moduleUrl = (buffer: ArrayBuffer) =>
+    URL.createObjectURL(new Blob([buffer], { type: "text/javascript" }));
+
+  // the last lines of a Python error, from the first line of the script
+  const shortError = (error: unknown) => {
+    const lines = String(
+      error instanceof Error ? error.message : error,
+    ).trimEnd();
+    const all = lines.split("\n");
+    const from = all.findIndex((line) => line.includes('File "<script>"'));
+    return (from >= 0 ? all.slice(from) : all.slice(-1)).join("\n");
+  };
+
+  async function start(message: Extract<ToWorker, { type: "start" }>) {
+    for (const [name, buffer] of Object.entries(message.files)) {
+      files.set(name, buffer);
+    }
+    const { loadPyodide } = (await load(
+      moduleUrl(files.get("pyodide.mjs")!),
+    )) as { loadPyodide: (options: object) => Promise<Pyodide> };
+    const asm = (await load(moduleUrl(files.get("pyodide.asm.mjs")!))) as {
+      default: unknown;
+    };
+    servePyodideFiles(true);
+    try {
+      pyodide = await loadPyodide({
+        indexURL: base,
+        packageBaseUrl: base,
+        stdLibURL: `${base}python_stdlib.zip`,
+        lockFileContents: message.lock,
+        createPyodideModule: asm.default,
+        stdout: () => {},
+        stderr: () => {},
+      });
+    } finally {
+      servePyodideFiles(false);
+    }
+    pyodide.runPython(message.driver);
+  }
+
+  async function run(message: Extract<ToWorker, { type: "run" }>) {
+    const { code, args, project, files: scriptFiles } = message.run;
+    const logs: string[] = [];
+    // the files of a skill, which its scripts can import
+    const folder = "/skill";
+    for (const [path, buffer] of Object.entries(scriptFiles ?? {})) {
+      const full = `${folder}/${path}`;
+      pyodide.FS.mkdirTree(full.slice(0, full.lastIndexOf("/")));
+      pyodide.FS.writeFile(full, new Uint8Array(buffer));
+    }
+    // the packages of Pyodide that the code imports, from the panel
+    servePyodideFiles(true);
+    try {
+      const sources = [
+        code,
+        ...Object.entries(scriptFiles ?? {})
+          .filter(([path]) => path.endsWith(".py"))
+          .map(([, buffer]) => new TextDecoder().decode(buffer)),
+      ];
+      for (const source of sources) {
+        await pyodide.loadPackagesFromImports(source, {
+          messageCallback: () => {},
+          errorCallback: (text) => logs.push(text),
+        });
+      }
+    } finally {
+      servePyodideFiles(false);
+    }
+    port.postMessage({ type: "running", id: message.id });
+    pyodide.setStdout({ batched: (line) => logs.push(line) });
+    pyodide.setStderr({ batched: (line) => logs.push(line) });
+    const runner = pyodide.globals.get("_run");
+    try {
+      const result = await runner(
+        code,
+        (question: unknown) => ask({ type: "question", question }),
+        (text: string) => port.postMessage({ type: "progress", text }),
+        JSON.stringify(args ?? null),
+        JSON.stringify(project ?? null),
+        scriptFiles === undefined ? "" : folder,
+      );
+      return { result, logs };
+    } catch (error) {
+      return { error: shortError(error), logs };
+    } finally {
+      runner.destroy();
+    }
+  }
+
+  self.onmessage = (event: MessageEvent<{ port: MessagePort }>) => {
+    self.onmessage = null;
+    port = event.data.port;
+    port.onmessage = async ({ data }: MessageEvent<ToWorker>) => {
+      if (data.type === "answer") {
+        const request = pending.get(data.id);
+        pending.delete(data.id);
+        if (data.error === undefined) {
+          request?.resolve(data.value);
+        } else {
+          request?.reject(new Error(data.error));
+        }
+        return;
+      }
+      try {
+        const value =
+          data.type === "start" ? await start(data) : await run(data);
+        port.postMessage({ type: "done", id: data.id, value });
+      } catch (error) {
+        port.postMessage({
+          type: "failed",
+          id: data.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    };
+  };
+}
+
+/** Python, started in a sandbox that stays for the next runs */
+export type PythonKernel = {
+  /**
+   * Runs Python code: loads the packages it imports, then runs its function
+   * main(tm). The time limit starts once the packages are loaded.
+   *
+   * @param run - The code (with its files, for a script of a skill), its
+   * arguments and the project state
+   * @param answer - Answers the questions of tm, e.g. the values of a column
+   * @param options - The longest time the code may run, in milliseconds;
+   * what to do with its progress, and when it starts to run; an optional
+   * abort signal, which stops it
+   * @returns What the code returned or why it failed, and what it printed
+   * @throws If the code takes too long or is stopped: then the kernel is
+   * stopped too
+   */
+  run: (
+    run: ScriptRun & { files?: Record<string, ArrayBuffer> },
+    answer: (question: ScriptQuestion) => Promise<unknown>,
+    options: {
+      timeLimit: number;
+      onProgress?: (text: string) => void;
+      onRunning?: () => void;
+      signal?: AbortSignal;
+    },
+  ) => Promise<ScriptOutcome>;
+  /** Stops Python, whatever it is doing, and removes its sandbox */
+  stop: () => void;
+  /** Whether it was stopped, and cannot run anything any more */
+  isStopped: () => boolean;
+};
+
+/**
+ * Starts Python in a new sandbox: gives it the files of Pyodide, which may
+ * be downloaded first
+ *
+ * @param files - The files of Python, see python-files.ts
+ * @param options - Optional abort signal, which stops the start
+ * @returns The kernel
+ * @throws If Python cannot start, e.g. a file cannot be downloaded, or if
+ * it is stopped
+ */
+export async function startPythonKernel(
+  files: PythonFiles,
+  options?: { signal?: AbortSignal },
+): Promise<PythonKernel> {
+  const { signal } = options ?? {};
+  signal?.throwIfAborted();
+  const iframe = document.createElement("iframe");
+  iframe.setAttribute("sandbox", "allow-scripts");
+  iframe.style.display = "none";
+  iframe.srcdoc = sandboxPage({
+    worker: workerMain,
+    policy: contentSecurityPolicy,
+  });
+  const channel = new MessageChannel();
+  // stops the downloads of a kernel that is stopped
+  const downloads = new AbortController();
+  const calls = new Map<
+    number,
+    { resolve: (value: unknown) => void; reject: (error: Error) => void }
+  >();
+  let nextId = 0;
+  let stopped = false;
+  /** What the run in progress does with the questions and the progress */
+  let current: {
+    answer: (question: ScriptQuestion) => Promise<unknown>;
+    onProgress?: (text: string) => void;
+    onRunning: () => void;
+  } | null = null;
+
+  const call = (message: object, transfer: Transferable[] = []) =>
+    new Promise<unknown>((resolve, reject) => {
+      if (stopped) {
+        reject(new Error("Python was stopped"));
+        return;
+      }
+      const id = nextId++;
+      calls.set(id, { resolve, reject });
+      channel.port1.postMessage({ ...message, id }, transfer);
+    });
+
+  const stop = (reason: Error = new Error("Python was stopped")) => {
+    if (stopped) {
+      return;
+    }
+    stopped = true;
+    window.removeEventListener("message", onPageMessage);
+    downloads.abort(reason);
+    channel.port1.close();
+    // also stops the worker, whatever it is doing
+    iframe.remove();
+    for (const pending of calls.values()) {
+      pending.reject(reason);
+    }
+    calls.clear();
+  };
+
+  const reply = (id: number, work: () => Promise<unknown>) => {
+    work()
+      .then((value) => {
+        channel.port1.postMessage(
+          { type: "answer", id, value },
+          value instanceof ArrayBuffer ? [value] : [],
+        );
+      })
+      .catch((problem: unknown) => {
+        // also a value that cannot be copied to the sandbox is an error
+        channel.port1.postMessage({
+          type: "answer",
+          id,
+          error: problem instanceof Error ? problem.message : String(problem),
+        });
+      });
+  };
+
+  channel.port1.onmessage = ({ data }: MessageEvent<FromWorker>) => {
+    if (data.type === "file") {
+      reply(data.id, () => files.get(data.name, { signal: downloads.signal }));
+    } else if (data.type === "question") {
+      const answer = current?.answer;
+      reply(data.id, () =>
+        answer === undefined
+          ? Promise.reject(new Error("nothing is running"))
+          : answer(data.question),
+      );
+    } else if (data.type === "progress") {
+      current?.onProgress?.(data.text);
+    } else if (data.type === "running") {
+      current?.onRunning();
+    } else {
+      const pending = calls.get(data.id);
+      calls.delete(data.id);
+      if (data.type === "done") {
+        pending?.resolve(data.value);
+      } else {
+        pending?.reject(new Error(data.error));
+      }
+    }
+  };
+
+  let started: () => void;
+  let failed: (error: Error) => void;
+  const ready = new Promise<void>((resolve, reject) => {
+    started = resolve;
+    failed = reject;
+  });
+  function onPageMessage(
+    event: MessageEvent<{ type?: string; error?: string }>,
+  ): void {
+    if (event.source !== iframe.contentWindow) {
+      return;
+    }
+    if (event.data.type === "ready") {
+      // an opaque origin cannot be named: "*", but only to this iframe
+      iframe.contentWindow!.postMessage({ type: "run", run: null }, "*", [
+        channel.port2,
+      ]);
+      started();
+    } else if (event.data.type === "failed") {
+      const error = new Error(
+        `Python could not start: ${event.data.error ?? "unknown error"}`,
+      );
+      failed(error);
+      stop(error);
+    }
+  }
+  window.addEventListener("message", onPageMessage);
+  const onAbort = () => {
+    const reason = signal!.reason as Error;
+    failed(reason);
+    stop(reason);
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+  document.body.append(iframe);
+
+  try {
+    await ready;
+    const given: Record<string, ArrayBuffer> = {};
+    for (const name of coreFiles) {
+      given[name] = await files.get(name, { signal: downloads.signal });
+    }
+    const lock = new TextDecoder().decode(
+      await files.get(lockFile, { signal: downloads.signal }),
+    );
+    await call(
+      { type: "start", files: given, lock, driver },
+      Object.values(given),
+    );
+  } catch (error) {
+    stop(error instanceof Error ? error : new Error(String(error)));
+    throw signal?.aborted ? (signal.reason as Error) : error;
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
+  }
+
+  return {
+    stop: () => stop(),
+    isStopped: () => stopped,
+    run: (
+      run,
+      answer,
+      { timeLimit, onProgress, onRunning, signal: stopRun },
+    ) => {
+      if (stopRun?.aborted) {
+        return Promise.reject(stopRun.reason as Error);
+      }
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const onStop = () => stop(stopRun!.reason as Error);
+      stopRun?.addEventListener("abort", onStop, { once: true });
+      current = {
+        answer,
+        onProgress,
+        // the time limit starts once the packages are there
+        onRunning: () => {
+          onRunning?.();
+          timer = setTimeout(() => {
+            stop(
+              new Error(
+                `the script took longer than ${timeLimit / 1000} seconds, and was stopped`,
+              ),
+            );
+          }, timeLimit);
+        },
+      };
+      const transfer = Object.values(run.files ?? {});
+      return (
+        call({ type: "run", run }, transfer) as Promise<ScriptOutcome>
+      ).finally(() => {
+        clearTimeout(timer);
+        stopRun?.removeEventListener("abort", onStop);
+        current = null;
+      });
+    },
+  };
+}

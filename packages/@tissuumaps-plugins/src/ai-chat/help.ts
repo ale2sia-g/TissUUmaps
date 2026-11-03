@@ -135,14 +135,20 @@ export const helpText = `How to use this chat
 12. Computing on the data
    With OpenAI and Anthropic, the assistant can also answer questions that need
    a computation, e.g. "how many cells are in each cluster?". It writes a short
-   JavaScript program and runs it in the same sandbox as the scripts of skills:
-   it can read the data, but cannot change the project, use the internet or see
-   your API key. No skill is needed: statistics, comparisons, correlations,
+   program and runs it in a sandbox like that of the scripts of skills: it can
+   read the data, but cannot change the project, use the internet or see your
+   API key. No skill is needed: statistics, comparisons, correlations,
    thresholds and spatial analyses with the coordinates of the cells all work.
-   It cannot yet read the pixels of images, draw charts or use libraries such
-   as scipy. The program is shown in the chat before it runs, as one line
-   (📜): click it to read the code. "Stop" stops it, and after two minutes it
-   stops by itself.
+   The program is shown in the chat before it runs, as one line (📜): click it
+   to read the code. "Stop" stops it, and after two minutes it stops by itself.
+   Simple computations are in JavaScript; statistical tests, models and the
+   like in Python, with numpy, scipy, pandas and scikit-learn. The first time,
+   Python is downloaded (about 14 MB, up to about 40 MB with its packages), and
+   the line of the tool shows how far it is, with "Stop". The files are checked
+   and kept in this browser, so the next time Python starts in a few seconds;
+   "Forget Python files", in the settings, removes them. Python only works in a
+   secure page (https, or localhost). It cannot yet read the pixels of images
+   or draw charts.
 
 What the assistant can do: answer questions about the open project, show or hide
 images, labels, points and shapes, make them more or less transparent, make
