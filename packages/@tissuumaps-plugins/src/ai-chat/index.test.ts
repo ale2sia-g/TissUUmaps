@@ -3964,17 +3964,19 @@ describe("aiChatPlugin", () => {
         }),
         getDirectoryHandle: (name: string) =>
           Promise.resolve(writable(`${path}/${name}`)),
-        getFileHandle: (name: string) =>
-          Promise.resolve({
-            createWritable: () =>
-              Promise.resolve({
-                write: (text: string) => {
-                  written.set(`${path}/${name}`, text);
-                  return Promise.resolve();
-                },
-                close: () => Promise.resolve(),
-              }),
-          }),
+        getFileHandle: (name: string, options?: { create?: boolean }) =>
+          options?.create === true || written.has(`${path}/${name}`)
+            ? Promise.resolve({
+                createWritable: () =>
+                  Promise.resolve({
+                    write: (text: string) => {
+                      written.set(`${path}/${name}`, text);
+                      return Promise.resolve();
+                    },
+                    close: () => Promise.resolve(),
+                  }),
+              })
+            : Promise.reject(new DOMException(name, "NotFoundError")),
       });
       panel.appStore.setState({
         workspace: writable("") as FileSystemDirectoryHandle,
@@ -3984,25 +3986,58 @@ describe("aiChatPlugin", () => {
       services.answers = [{ toolCalls: [runSaving()] }, { content: "Saved." }];
       await panel.say("Compute the neighbors.");
 
-      const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
-      const keep = ["save_computed_table", { table: "table (chat)" }] as [
-        string,
-        Record<string, unknown>,
+      // the file name the user gave, which must be a valid one
+      const keep = (fileName: string): [string, Record<string, unknown>] => [
+        "save_computed_table",
+        { table: "table (chat)", file_name: fileName },
       ];
-      services.answers = [{ toolCalls: [keep] }, { content: "Not kept." }];
-      await panel.say("Keep the table.");
+      services.answers = [
+        { toolCalls: [keep("a/b")] },
+        { content: "Not a name." },
+      ];
+      await panel.say("Save it as a/b.");
+      expect(panel.texts("Tool").at(-1)).toContain(
+        'Error: "a/b" is not a valid file name',
+      );
+
+      // the user's choice is a note, not an error
+      const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+      services.answers = [
+        { toolCalls: [keep("vicini_cluster3")] },
+        { content: "Not kept." },
+      ];
+      await panel.say("Save it as vicini_cluster3.csv.");
       expect(confirm.mock.calls[0]?.[0]).toContain(
-        'Save the table "table (chat)", computed by the chat, as the file computed/table-chat.csv next to the project file, in the folder "root"?',
+        'Save the table "table (chat)", computed by the chat, as the file computed/vicini_cluster3.csv next to the project file, in the folder "root"?',
       );
       expect(panel.texts("Tool").at(-1)).toContain(
-        'Error: the user did not want "table (chat)" to be saved as a file.',
+        'Note: the user did not want "table (chat)" to be saved as a file.',
       );
       expect(written.size).toBe(0);
 
+      // a file of that name is replaced only if the user wants
+      written.set("/xenium/computed/vicini_cluster3.csv", "old");
+      confirm.mockReturnValueOnce(true).mockReturnValueOnce(false);
+      services.answers = [
+        { toolCalls: [keep("vicini_cluster3")] },
+        { content: "Not replaced." },
+      ];
+      await panel.say("Save it as vicini_cluster3.csv, I am sure.");
+      expect(confirm.mock.calls.at(-1)?.[0]).toBe(
+        'The folder "computed" next to the project file already has a file vicini_cluster3.csv. Replace it with "table (chat)"?',
+      );
+      expect(panel.texts("Tool").at(-1)).toContain(
+        'Note: "table (chat)" was not saved: the file computed/vicini_cluster3.csv already exists, and the user did not want to replace it.',
+      );
+      expect(written.get("/xenium/computed/vicini_cluster3.csv")).toBe("old");
+
       confirm.mockReturnValue(true);
-      services.answers = [{ toolCalls: [keep] }, { content: "Kept." }];
-      await panel.say("Keep the table, I am sure.");
-      const csv = written.get("/xenium/computed/table-chat.csv") ?? "";
+      services.answers = [
+        { toolCalls: [keep("vicini_cluster3.csv")] },
+        { content: "Kept." },
+      ];
+      await panel.say("Replace it.");
+      const csv = written.get("/xenium/computed/vicini_cluster3.csv") ?? "";
       expect(csv.split("\n").slice(0, 3)).toEqual([
         "id,neighbors",
         "cell-1,0",
@@ -4010,11 +4045,11 @@ describe("aiChatPlugin", () => {
       ]);
       expect(computedTable(panel)?.dataSource).toEqual({
         type: "csv",
-        source: "computed/table-chat.csv",
+        source: "computed/vicini_cluster3.csv",
         idColumn: "id",
       });
       expect(panel.texts("Tool").at(-1)).toContain(
-        'Done: "table (chat)" was saved as computed/table-chat.csv next to the project file',
+        'Done: "table (chat)" was saved as computed/vicini_cluster3.csv next to the project file',
       );
       // Undo does not take back a table that is a file now
       panel.button("Undo").click();
@@ -4038,17 +4073,52 @@ describe("aiChatPlugin", () => {
           downloads.push(this.download);
         },
       );
+      // a useful name is proposed, which the user can accept
+      const today = new Date();
+      const day = [
+        today.getFullYear(),
+        String(today.getMonth() + 1).padStart(2, "0"),
+        String(today.getDate()).padStart(2, "0"),
+      ].join("-");
+      const prompt = vi
+        .spyOn(window, "prompt")
+        .mockImplementation((_message, proposal) => proposal ?? null);
       panel.button("Download CSV").click();
-      expect(downloads).toEqual(["table-chat.csv"]);
-      expect(panel.texts("Note").at(-1)).toBe(
-        '"table (chat)" was downloaded as table-chat.csv, with the item IDs in the column "id". In TissUUmaps the table stays temporary.',
+      expect(prompt.mock.calls[0]?.[0]).toBe(
+        'Download "table (chat)" as a CSV file.\n\nFile name:',
       );
+      expect(downloads).toEqual([`table-neighbors-${day}.csv`]);
+      expect(panel.texts("Note").at(-1)).toBe(
+        `"table (chat)" was downloaded as table-neighbors-${day}.csv, with the item IDs in the column "id". In TissUUmaps the table stays temporary.`,
+      );
+
+      // or change: a name that is not valid is asked again
+      prompt.mockReset();
+      prompt.mockReturnValueOnce("bad/name").mockReturnValueOnce("vicini");
+      panel.button("Download CSV").click();
+      expect(prompt.mock.calls[1]?.[0]).toContain(
+        '"bad/name" is not a valid file name',
+      );
+      expect(prompt.mock.calls[1]?.[1]).toBe("bad/name");
+      expect(downloads.at(-1)).toBe("vicini.csv");
+      // or cancel
+      prompt.mockReturnValueOnce(null);
+      panel.button("Download CSV").click();
+      expect(downloads).toHaveLength(2);
+
+      // without a connected folder, Keep as CSV downloads the file instead,
+      // which is not an error
+      prompt.mockImplementation((_message, proposal) => proposal ?? null);
       panel.button("Keep as CSV").click();
+      expect(prompt.mock.calls.at(-1)?.[0]).toBe(
+        'This project was not opened from a connected folder, so "table (chat)" is downloaded as a CSV file instead.\n\nFile name:',
+      );
       await vi.waitFor(() =>
-        expect(panel.texts("Error").at(-1)).toContain(
-          'the project was not opened from a connected folder, so "table (chat)" cannot be written next to it.',
+        expect(panel.texts("Note").at(-1)).toContain(
+          `the project was not opened from a connected folder, so "table (chat)" cannot be written next to it; it was downloaded instead. "table (chat)" was downloaded as table-neighbors-${day}.csv`,
         ),
       );
+      expect(panel.texts("Error")).toEqual([]);
       expect(computedTable(panel)?.dataSource.type).toBe("ai-chat");
     });
 

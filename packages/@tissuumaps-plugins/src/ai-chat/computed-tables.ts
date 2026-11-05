@@ -338,15 +338,53 @@ export function computedTableCsv(table: ComputedTable): string {
 }
 
 /**
- * A file name for a table, e.g. "cells-chat.csv" for "cells (chat)"
+ * A useful name for the CSV file of a computed table: its original table, its
+ * columns and the day, e.g. "cell_circles-c3_group-2026-11-05.csv"
  *
- * @param name - The name of the table
+ * @param tableName - The name of the table, e.g. "cell_circles (chat)"
+ * @param columns - Its columns
+ * @param day - The day, today by default
  * @returns The file name
  */
-export function csvFileName(name: string): string {
-  const slug = name
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-  return `${slug || "table"}.csv`;
+export function suggestCsvName(
+  tableName: string,
+  columns: string[],
+  day = new Date(),
+): string {
+  // only letters, digits, "." and "_" in each part, which "-" separates
+  const part = (text: string) =>
+    text.replace(/[^\p{L}\p{N}._]+/gu, "_").replace(/^[_.]+|[_.]+$/g, "");
+  const date = [
+    day.getFullYear(),
+    String(day.getMonth() + 1).padStart(2, "0"),
+    String(day.getDate()).padStart(2, "0"),
+  ].join("-");
+  const origin = part(tableName.replace(/\s*\(chat\)$/, "")) || "table";
+  const columnsPart = part(part(columns.join("_")).slice(0, 40));
+  return `${[origin, columnsPart, date].filter((text) => text !== "").join("-")}.csv`;
+}
+
+/**
+ * Checks the name of a CSV file, and adds ".csv" if it is missing
+ *
+ * @param given - The name, e.g. "vicini_cluster3"
+ * @returns The name, e.g. "vicini_cluster3.csv", or why it is not valid
+ */
+export function csvFileName(
+  given: string,
+): { name: string } | { error: string } {
+  const trimmed = given.trim();
+  const name = /\.csv$/i.test(trimmed) ? trimmed : `${trimmed}.csv`;
+  const stem = name.slice(0, -".csv".length);
+  const valid =
+    name.length <= 100 &&
+    /^[\p{L}\p{N}][\p{L}\p{N} ._()-]*$/u.test(stem) &&
+    !/[. ]$/.test(stem) &&
+    // names that Windows keeps for itself
+    !/^(con|prn|aux|nul|com\d|lpt\d)(\..*)?$/i.test(stem);
+  return valid
+    ? { name }
+    : {
+        error: `"${given}" is not a valid file name: use letters, digits, spaces, "-", "_", "." and "( )", without folders, and at most 100 characters`,
+      };
 }

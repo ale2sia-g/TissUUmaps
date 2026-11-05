@@ -154,7 +154,9 @@ export const helpText = `How to use this chat
    e.g. "cells (chat)"; the original data is never changed, and "Undo" takes
    it back. Such a table is temporary: it is lost when the page is reloaded.
    "Keep as CSV" writes it as a file next to the project (in a connected
-   folder), and "Download CSV" downloads it.
+   folder), and "Download CSV" downloads it. Both ask for the name of the
+   file, and propose one with the table, its columns and the day; you can
+   also tell the assistant the name, e.g. "save it as neighbors.csv".
 
 What the assistant can do: answer questions about the open project, show or hide
 images, labels, points and shapes, make them more or less transparent, make

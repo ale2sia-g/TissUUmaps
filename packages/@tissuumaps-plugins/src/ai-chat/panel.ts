@@ -25,6 +25,7 @@ import {
   keepVersion,
   maxComputedColumns,
   registerComputedTables,
+  suggestCsvName,
   valuesByRow,
   versionOf,
   withComputedTables,
@@ -1735,14 +1736,35 @@ export function mountAiChat(
     buttons.style.cssText = "display: flex; gap: 6px; margin-top: 4px;";
     const keep = makeButton(
       "Keep as CSV",
-      () => void keepComputedTable(tableId).then(reportKept),
+      () => {
+        const target = keepTarget();
+        const fileName = askCsvName(
+          tableId,
+          target === undefined
+            ? `This project was not opened from a connected folder, so "${tableName}" is downloaded as a CSV file instead.`
+            : `Save "${tableName}" as a CSV file in the folder "computed" next to the project file, in "${target.name}". Then the project reads the table from that file.`,
+        );
+        if (fileName !== undefined) {
+          void keepComputedTable(tableId, { fileName, chosen: true }).then(
+            reportKept,
+          );
+        }
+      },
       smallButtonStyle,
     );
     keep.title =
       "Write the table as a CSV file next to the project file, in the connected folder";
     const download = makeButton(
       "Download CSV",
-      () => reportKept(downloadComputedTable(tableId)),
+      () => {
+        const fileName = askCsvName(
+          tableId,
+          `Download "${tableName}" as a CSV file.`,
+        );
+        if (fileName !== undefined) {
+          reportKept(downloadComputedTable(tableId, fileName));
+        }
+      },
       smallButtonStyle,
     );
     download.title = "Download the table as a CSV file";
@@ -1750,12 +1772,70 @@ export function mountAiChat(
     body.append(line, buttons);
   }
 
-  /** Shows what keeping or downloading a computed table did */
+  /**
+   * Shows what keeping or downloading a computed table did: only what went
+   * wrong is an error, not e.g. a download instead, or the user's own choice
+   */
   function reportKept(result: string): void {
     show(
       result.startsWith("Error") ? "Error" : "Note",
-      result.replace(/^(Error|Done): /, ""),
+      result.replace(/^(Error|Done|Note): /, ""),
     );
+  }
+
+  /**
+   * Asks the user for the name of the CSV file of a computed table, proposing
+   * one with the table, its columns and the day, until the name is valid
+   *
+   * @param tableId - The table computed by the chat
+   * @param action - What happens with the file
+   * @returns The name, with ".csv", or undefined if the user cancelled
+   */
+  function askCsvName(tableId: string, action: string): string | undefined {
+    const found = findComputedTable(tableId);
+    if ("error" in found) {
+      reportKept(found.error);
+      return undefined;
+    }
+    let problem = "";
+    let proposal = suggestCsvName(found.table.name, [
+      ...found.version.columns.keys(),
+    ]);
+    for (;;) {
+      const answer: unknown = window.prompt(
+        `${problem}${action}\n\nFile name:`,
+        proposal,
+      );
+      if (typeof answer !== "string") {
+        return undefined;
+      }
+      const checked = csvFileName(answer);
+      if ("name" in checked) {
+        return checked.name;
+      }
+      problem = `${checked.error}.\n\n`;
+      proposal = answer;
+    }
+  }
+
+  /**
+   * The connected folder that holds the project file, if the computed tables
+   * can be written next to it
+   *
+   * @returns The folder, or undefined for a project opened from elsewhere
+   */
+  function keepTarget(): FileSystemDirectoryHandle | undefined {
+    const workspace = appStore.getState().workspace ?? null;
+    const projectSource = projectStore.getState().source;
+    if (workspace === null || projectSource === null) {
+      return undefined;
+    }
+    const where = SourceUtils.normalizeSource(
+      "computed",
+      workspace,
+      projectSource,
+    );
+    return SourceUtils.isWorkspacePath(where) ? workspace : undefined;
   }
 
   /**
@@ -1792,42 +1872,53 @@ export function mountAiChat(
    * once saved and opened again, even without the chat
    *
    * @param wanted - The name or ID of the table
-   * @returns The result for the model
+   * @param options - The name of the file, if given (else a useful one), and
+   * whether the user chose it already, so that there is nothing more to ask
+   * than whether to replace a file of that name
+   * @returns The result for the model: "Done", "Note" when it was not kept
+   * (e.g. by the user's choice), or "Error"
    */
-  async function keepComputedTable(wanted: string): Promise<string> {
+  async function keepComputedTable(
+    wanted: string,
+    options?: { fileName?: string; chosen?: boolean },
+  ): Promise<string> {
     const found = findComputedTable(wanted);
     if ("error" in found) {
       return found.error;
     }
     const { table, version } = found;
-    const workspace = appStore.getState().workspace ?? null;
-    const projectSource = projectStore.getState().source;
-    const fileName = csvFileName(table.name);
-    const where =
-      projectSource === null
-        ? undefined
-        : SourceUtils.normalizeSource(
-            `computed/${fileName}`,
-            workspace,
-            projectSource,
-          );
-    if (
-      workspace === null ||
-      where === undefined ||
-      !SourceUtils.isWorkspacePath(where)
-    ) {
-      return `Error: the project was not opened from a connected folder, so "${table.name}" cannot be written next to it. ${downloadComputedTable(table.id).replace(/^Done: /, "Instead: ")}`;
+    const checked =
+      options?.fileName === undefined
+        ? { name: suggestCsvName(table.name, [...version.columns.keys()]) }
+        : csvFileName(options.fileName);
+    if ("error" in checked) {
+      return `Error: ${checked.error}.`;
+    }
+    const fileName = checked.name;
+    const workspace = keepTarget();
+    if (workspace === undefined) {
+      const downloaded = downloadComputedTable(table.id, fileName);
+      return downloaded.startsWith("Error")
+        ? downloaded
+        : `Done: the project was not opened from a connected folder, so "${table.name}" cannot be written next to it; it was downloaded instead. ${downloaded.replace(/^Done: /, "")}`;
     }
     if (!idsSurviveCsv(version.ids)) {
-      return `Error: the item IDs of "${table.name}" are text that looks like numbers, which a CSV file would turn into numbers, so the table would not match its items any more. It stays temporary.`;
+      return `Note: "${table.name}" cannot be kept as a CSV file: its item IDs are text that looks like numbers, which a CSV file would turn into numbers, so the table would not match its items any more. It stays temporary; Download CSV still gives the file.`;
     }
-    const allowed = window.confirm(
-      `Save the table "${table.name}", computed by the chat, as the file computed/${fileName} next to the project file, in the folder "${workspace.name}"?\n\n` +
-        "Then the project reads the table from that file, also after it is saved and opened again.",
-    );
+    const allowed =
+      options?.chosen === true ||
+      window.confirm(
+        `Save the table "${table.name}", computed by the chat, as the file computed/${fileName} next to the project file, in the folder "${workspace.name}"?\n\n` +
+          "Then the project reads the table from that file, also after it is saved and opened again.",
+      );
     if (!allowed) {
-      return `Error: the user did not want "${table.name}" to be saved as a file. It stays temporary; do not ask again unless the user does.`;
+      return `Note: the user did not want "${table.name}" to be saved as a file. It stays temporary; do not ask again unless the user does.`;
     }
+    const where = SourceUtils.normalizeSource(
+      `computed/${fileName}`,
+      workspace,
+      projectStore.getState().source,
+    );
     try {
       const folder = workspace as FileSystemDirectoryHandle & {
         requestPermission?: (options: {
@@ -1838,7 +1929,7 @@ export function mountAiChat(
         folder.requestPermission !== undefined &&
         (await folder.requestPermission({ mode: "readwrite" })) !== "granted"
       ) {
-        return `Error: the browser was not allowed to write into the folder "${workspace.name}", so "${table.name}" stays temporary.`;
+        return `Note: the browser was not allowed to write into the folder "${workspace.name}", so "${table.name}" stays temporary.`;
       }
       const segments = SourceUtils.getPathSegments(where);
       let directory: FileSystemDirectoryHandle = workspace;
@@ -1847,6 +1938,18 @@ export function mountAiChat(
           // only the folder "computed" is made
           create: index === segments.length - 2,
         });
+      }
+      const exists = await directory.getFileHandle(fileName).then(
+        () => true,
+        () => false,
+      );
+      if (
+        exists &&
+        !window.confirm(
+          `The folder "computed" next to the project file already has a file ${fileName}. Replace it with "${table.name}"?`,
+        )
+      ) {
+        return `Note: "${table.name}" was not saved: the file computed/${fileName} already exists, and the user did not want to replace it. It stays temporary; another file name would do.`;
       }
       const file = await directory.getFileHandle(fileName, { create: true });
       const writable = await file.createWritable();
@@ -1872,15 +1975,23 @@ export function mountAiChat(
    * in the column "id"
    *
    * @param wanted - The name or ID of the table
+   * @param given - The name of the file, else a useful one
    * @returns The result for the model
    */
-  function downloadComputedTable(wanted: string): string {
+  function downloadComputedTable(wanted: string, given?: string): string {
     const found = findComputedTable(wanted);
     if ("error" in found) {
       return found.error;
     }
     const { table, version } = found;
-    const fileName = csvFileName(table.name);
+    const checked =
+      given === undefined
+        ? { name: suggestCsvName(table.name, [...version.columns.keys()]) }
+        : csvFileName(given);
+    if ("error" in checked) {
+      return `Error: ${checked.error}.`;
+    }
+    const fileName = checked.name;
     const url = URL.createObjectURL(
       new Blob([computedTableCsv(version)], { type: "text/csv" }),
     );

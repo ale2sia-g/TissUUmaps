@@ -114,7 +114,10 @@ export type ToolContext = {
    *
    * @returns The result for the model
    */
-  keepComputedTable: (table: string) => Promise<string>;
+  keepComputedTable: (
+    table: string,
+    options?: { fileName?: string },
+  ) => Promise<string>;
 };
 
 /** How code runs in the sandbox */

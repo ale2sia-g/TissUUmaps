@@ -65,6 +65,11 @@ export const saveComputedTableDefinition = {
           type: "string",
           description: 'The name of the table, e.g. "cells (chat)".',
         },
+        file_name: {
+          type: "string",
+          description:
+            'Only if the user names the file, e.g. "neighbors_cluster3.csv". Without it, the name says the table, its columns and the day.',
+        },
       },
     },
   },
@@ -125,7 +130,8 @@ export const codeInstructions = [
   "saved column never changes the data of the project, and Undo takes it back. It is",
   "temporary: it is lost when the page is reloaded, unless the user keeps the table with",
   "save_computed_table, which writes it as a CSV file next to the project file (or",
-  "downloads it). Say so when you save one. At most 20 columns can be saved in all.",
+  "downloads it); if the user names the file, give that name as file_name. Say so when",
+  "you save one. At most 20 columns can be saved in all.",
   "",
   "Use the table ids or names and the column names of the summary, or list them with",
   "tm.tables() and tm.columns() first. Tell the user which method you used, e.g. which",
@@ -204,5 +210,9 @@ export function saveComputedTableTool(
       'Error: give the name of the table, e.g. "cells (chat)".',
     );
   }
-  return context.keepComputedTable(table.trim());
+  const fileName = args["file_name"];
+  return context.keepComputedTable(
+    table.trim(),
+    typeof fileName === "string" && fileName.trim() !== "" ? { fileName } : {},
+  );
 }

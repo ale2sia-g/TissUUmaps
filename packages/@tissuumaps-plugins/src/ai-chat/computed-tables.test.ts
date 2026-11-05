@@ -14,6 +14,7 @@ import {
   idsSurviveCsv,
   keepVersion,
   registerComputedTables,
+  suggestCsvName,
   valuesByRow,
   versionOf,
 } from "./computed-tables";
@@ -123,8 +124,31 @@ describe("CSV", () => {
     expect(computedTableCsv(table())).toBe(
       'id,neighbors,zone\na,3,edge\nb,,"say ""hi"", twice"\nc,5,\n',
     );
-    expect(csvFileName("cells (chat)")).toBe("cells-chat.csv");
-    expect(csvFileName("(chat)")).toBe("chat.csv");
+  });
+
+  it("proposes a file name with the table, its columns and the day", () => {
+    const day = new Date(2026, 10, 5);
+    expect(suggestCsvName("cell_circles (chat)", ["c3_group"], day)).toBe(
+      "cell_circles-c3_group-2026-11-05.csv",
+    );
+    expect(
+      suggestCsvName("table (chat)", ["neighbors 30 µm", "zone"], day),
+    ).toBe("table-neighbors_30_µm_zone-2026-11-05.csv");
+    expect(suggestCsvName("(chat)", [], day)).toBe("table-2026-11-05.csv");
+  });
+
+  it("accepts only valid file names, and adds .csv", () => {
+    expect(csvFileName(" vicini_cluster3 ")).toEqual({
+      name: "vicini_cluster3.csv",
+    });
+    expect(csvFileName("Cells (near) 2.CSV")).toEqual({
+      name: "Cells (near) 2.CSV",
+    });
+    for (const bad of ["", "a/b", "..\\x", "x?.csv", ".hidden", "con", "a."]) {
+      expect(csvFileName(bad)).toEqual({
+        error: `"${bad}" is not a valid file name: use letters, digits, spaces, "-", "_", "." and "( )", without folders, and at most 100 characters`,
+      });
+    }
   });
 
   it("knows which IDs come back the same from a CSV file", () => {
