@@ -178,16 +178,17 @@ export default async function (tm) {
 }
 ```
 
-| `tm`                           | What it gives                                                                              |
-| ------------------------------ | ------------------------------------------------------------------------------------------ |
-| `tm.args`                      | the arguments the model gave, as the instructions of the skill describe them               |
-| `tm.project`                   | a copy of the state of the project, the same JSON the model gets                           |
-| `await tm.tables()`            | the tables of the project, with their `id` and `name`                                      |
-| `await tm.columns(table)`      | the columns of a table, with `matrix: true` for matrices such as `X`                       |
-| `await tm.columns(table, "X")` | the columns of a matrix, e.g. `X[EPCAM]`                                                   |
-| `await tm.read(table, column)` | the values of a column, e.g. `obs/leiden` or `X[EPCAM]` (tables of at most 5 million rows) |
-| `await tm.readFile(path)`      | the text of another file of the skill                                                      |
-| `tm.progress(text)`            | shows how far the script is, next to the _Stop_ button                                     |
+| `tm`                                       | What it gives                                                                                     |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------- |
+| `tm.args`                                  | the arguments the model gave, as the instructions of the skill describe them                      |
+| `tm.project`                               | a copy of the state of the project, the same JSON the model gets                                  |
+| `await tm.tables()`                        | the tables of the project, with their `id` and `name`                                             |
+| `await tm.columns(table)`                  | the columns of a table, with `matrix: true` for matrices such as `X`                              |
+| `await tm.columns(table, "X")`             | the columns of a matrix, e.g. `X[EPCAM]`                                                          |
+| `await tm.read(table, column)`             | the values of a column, e.g. `obs/leiden` or `X[EPCAM]` (tables of at most 5 million rows)        |
+| `await tm.readFile(path)`                  | the text of another file of the skill                                                             |
+| `tm.progress(text)`                        | shows how far the script is, next to the _Stop_ button                                            |
+| `await tm.saveColumn(table, name, values)` | saves a result as a column, one value per row (see [Results on the image](#results-on-the-image)) |
 
 Scripts run in a sandbox, which keeps them away from everything else: they can read the data through `tm`, but get only copies, so they cannot change the project; they cannot use the network, load other code, use `eval`, or reach the page, its storage or the API key. To change what is shown, the model uses its tools with what the script returned. Python scripts cannot run yet.
 
@@ -201,9 +202,17 @@ JavaScript starts at once, and the assistant uses it for counts, means and other
 
 The first time, Python is downloaded from [jsDelivr](https://www.jsdelivr.com/): about 14 MB to start, and the packages that the code imports when it first needs them (about 37 MB with numpy, scipy, pandas and matplotlib). While it downloads, the row of the tool shows how far it is (e.g. _Downloading Python, 12 of 37 MB_), with _Stop_. Each file is checked against its SHA-256 before it is used, and kept in this browser, so that the next time Python starts without downloading anything (in a few seconds); _Forget Python files_, in the settings (⚙), removes them. Python can only be checked, and so used, in a secure page (https, or localhost). Once started, Python stays for the next code of the chat; it starts again after _Stop_, _New chat_, or when another project is opened. The two minutes of the time limit do not count the download and the start.
 
-It cannot yet read the pixels of images or draw charts, and gives the results as text. The code cannot add columns to the tables either; to show what it found, the assistant uses its tools, e.g. to show only some groups.
+It cannot yet read the pixels of images or draw charts, and gives the results as text. The code cannot change the data of the project, but it can save its results as new columns, to color or filter by them (see below).
 
 The code is shown in the chat before it runs, as one line such as _📜 Dia's code: cells per cluster_: click it to read the code, and _Copy_ copies it. It runs without asking, like the scripts of the skills you added. While it runs, a row shows for how long, and its _Stop_ button stops it; code that runs longer than two minutes is stopped. The assistant answers from what the code returned, and says so if the code failed.
+
+### Results on the image
+
+To show a result on the image, e.g. _"color the cells by the number of their neighbors within 30 µm"_, the code saves it as a column, one value per row of a table: `await tm.saveColumn(table, name, values)` in JavaScript, `await tm.save_column(table, name, values)` in Python (with `{ ids }` or `ids=` for values of some of the items only). The values go straight from the sandbox to the panel, never through the model. The panel keeps the column in a table of its own, e.g. _cells (chat)_ for the table _cells_, with the same items, so that the colors and filters can use it like the other columns: numbers get a color scale, text one color per group. The original data is never changed. The chat shows each new column in a row, e.g. _📊 New column neighbors in cells (chat)_; _Undo_ takes it back, with the colors that used it. At most 20 columns can be saved in all.
+
+A computed table is temporary: its values live in this page. To keep it, click _Keep as CSV_ in its row, or ask the assistant to save it: after you confirm, it is written as a CSV file next to the project file, in the folder `computed`, with the item IDs in the column `id`, and the project reads the table from that file from then on, also once saved and opened again, even without the chat. This needs a project opened from a connected folder, and the browser asks for the permission to write into it. Otherwise, _Download CSV_ downloads the file, and the table stays temporary.
+
+A project saved with a temporary table still works when it is opened again: in the same page, the table is still there; after the page was reloaded, its values are gone, so TissUUmaps says that the table could not be loaded, and what was colored by it gets its default color again.
 
 ## Limitations
 
@@ -249,6 +258,8 @@ The names, tones and avatars of Dia and Aid, and the words shown while the model
 The model sees the skills progressively, as the format intends: the names and descriptions of the skills that are on go with the context of each turn, between the project summary and the app state; the instructions of a skill come back as the result of the tool `load_skill(name)`, and its other files as the result of `read_skill_file(skill, path)` (text only, at most 50,000 characters). Both tools, and the rules for using skills, are always part of the tools and the fixed instructions of OpenAI and Anthropic, also without skills, so that the beginning of the requests stays the same for the prompt cache. They are in `skill-tools.ts`.
 
 The skills of the project are read in `project-skills.ts`, again whenever another project is opened or another folder is connected. The folder `skills` is found with `SourceUtils.normalizeSource("skills", workspace, source)`, like a project-relative data source: in the workspace, its files are listed (hidden ones left out, at most 1000); for a project opened from a URL, the files listed in `skills/index.json` are downloaded, and paths that leave the `skills` folder are refused. Without a `skills` folder or a `skills/index.json`, the project simply has no skills.
+
+The computed tables are in `computed-tables.ts`. The panel registers a table data provider for the data source type `ai-chat` (`registerTableDataProvider`), which loads them from memory. Each change of the columns makes a new version of the table, with a new source, since TissUUmaps keeps the values it has read of each source; Undo puts the previous source back, or deletes the table. A computed table has the item IDs of its original table, so it annotates the same items; TissUUmaps only loads a table once something it shows uses it, so the panel reads the computed tables from memory. _Keep as CSV_ writes the file with the File System Access API and changes the data source of the table to a CSV file with `idColumn: "id"`; item IDs that are text looking like numbers would come back as numbers, so such a table is not written.
 
 The tool `run_code(title, language, code)` (in `code-tool.ts`) is offered, like the skills, only to OpenAI and Anthropic. The panel runs JavaScript like a script of a skill, in the same sandbox and with the same time limit, but never asks first, since the code comes from the conversation with the user; the call is shown with its title (and language) only, since the code has its own row.
 

@@ -254,6 +254,7 @@ export const toolIcons: Record<string, string> = {
   read_skill_file: "📄",
   run_script: "🧪",
   run_code: "🧮",
+  save_computed_table: "💾",
 };
 
 /**

@@ -149,6 +149,12 @@ export const helpText = `How to use this chat
    "Forget Python files", in the settings, removes them. Python only works in a
    secure page (https, or localhost). It cannot yet read the pixels of images
    or draw charts.
+   To show a result on the image (e.g. "color the cells by the number of their
+   neighbors"), the program saves it as a new column of a table of its own,
+   e.g. "cells (chat)"; the original data is never changed, and "Undo" takes
+   it back. Such a table is temporary: it is lost when the page is reloaded.
+   "Keep as CSV" writes it as a file next to the project (in a connected
+   folder), and "Download CSV" downloads it.
 
 What the assistant can do: answer questions about the open project, show or hide
 images, labels, points and shapes, make them more or less transparent, make

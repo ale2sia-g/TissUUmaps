@@ -40,7 +40,9 @@ const sandbox = vi.hoisted(() => {
     runs: (ScriptRun & { answers: unknown[] })[];
     /** "done", an error the sandbox throws, or "hang" until stopped */
     behavior: "done" | "hang" | Error;
-  } = { runs: [], behavior: "done" };
+    /** More questions the script asks, e.g. to save a column */
+    extra: ScriptQuestion[];
+  } = { runs: [], behavior: "done", extra: [] };
   return state;
 });
 vi.mock("./sandbox", () => ({
@@ -64,6 +66,11 @@ vi.mock("./sandbox", () => ({
         (error: Error) => error.message,
       ),
     ];
+    for (const question of sandbox.extra) {
+      answers.push(
+        await answer(question).catch((error: Error) => error.message),
+      );
+    }
     sandbox.runs.push({ ...run, answers });
     options.onProgress?.("half way");
     if (sandbox.behavior === "hang") {
@@ -101,6 +108,8 @@ const python = vi.hoisted(() => {
     startHangs: boolean;
     /** The files of Python that the browser keeps */
     files: number;
+    /** More questions the code asks, e.g. to save a column */
+    extra: ScriptQuestion[];
     onDownload?: (progress?: { done: number; total: number }) => void;
   } = {
     starts: 0,
@@ -109,6 +118,7 @@ const python = vi.hoisted(() => {
     behavior: "done",
     startHangs: false,
     files: 0,
+    extra: [],
   };
   return state;
 });
@@ -166,6 +176,11 @@ vi.mock("./python-sandbox", () => ({
             (error: Error) => error.message,
           ),
         ];
+        for (const question of python.extra) {
+          answers.push(
+            await answer(question).catch((error: Error) => error.message),
+          );
+        }
         python.runs.push({ ...run, answers });
         options.onRunning?.();
         options.onProgress?.("half way");
@@ -229,8 +244,13 @@ function makeTable({
   const loaded: string[] = [];
   const isChild = (query: string, path: string) =>
     path.startsWith(query) && !path.slice(query.length).includes("/");
+  // the IDs of the items, always the same array, like the real tables; made
+  // only when asked for, since some fake tables have millions of rows
+  let ids: string[] | undefined;
   const table = {
     loaded,
+    getIds: () =>
+      (ids ??= Array.from({ length: rows }, (_, i) => `cell-${i + 1}`)),
     getSize: () => rows,
     suggestColumnQueries: (query: string) => {
       const matrix = matrices[query];
@@ -354,6 +374,7 @@ function makeProjectStore(): ProjectStoreApi & {
     });
   type ListKind =
     | "layers"
+    | "tables"
     | "images"
     | "labels"
     | "points"
@@ -467,7 +488,13 @@ function makeProjectStore(): ProjectStoreApi & {
             dataSource: { type: "geoparquet", source: "cells.parquet" },
           }),
         ],
-        tables: [{ id: "tables/table", name: "table" }],
+        tables: [
+          {
+            id: "tables/table",
+            name: "table",
+            dataSource: { type: "anndata", source: "xenium.h5ad" },
+          },
+        ],
         colorMaps: [
           {
             id: "map-1",
@@ -507,6 +534,9 @@ function makeProjectStore(): ProjectStoreApi & {
         moveLabels: move("labels"),
         movePoints: move("points"),
         moveShapes: move("shapes"),
+        addTable: add("tables"),
+        updateTable: update("tables"),
+        deleteTable: remove("tables"),
       };
       return state as unknown as ProjectStore;
     }),
@@ -986,6 +1016,14 @@ function makeAppStore(): AppStoreApi {
     setExpandedPointsIds: (ids: string[]) => set({ expandedPointsIds: ids }),
     setExpandedShapesIds: (ids: string[]) => set({ expandedShapesIds: ids }),
     setExpandedTableIds: (ids: string[]) => set({ expandedTableIds: ids }),
+    tableDataProviders: new Map(),
+    registerTableDataProvider: (type: string, provider: unknown) =>
+      set((state) => ({
+        tableDataProviders: new Map([
+          ...(state.tableDataProviders as Map<string, unknown>),
+          [type, provider],
+        ]),
+      })),
   })) as unknown as AppStoreApi;
 }
 
@@ -1073,6 +1111,7 @@ async function openPanel(
   return {
     projectStore,
     appStore,
+    dataStore,
     container,
     unmount,
     status: () => status.textContent,
@@ -3333,6 +3372,7 @@ describe("aiChatPlugin", () => {
     beforeEach(() => {
       sandbox.runs.length = 0;
       sandbox.behavior = "done";
+      sandbox.extra = [];
       Object.assign(python, {
         starts: 0,
         stops: 0,
@@ -3340,6 +3380,7 @@ describe("aiChatPlugin", () => {
         behavior: "done",
         startHangs: false,
         files: 0,
+        extra: [],
       });
     });
 
@@ -3750,6 +3791,265 @@ describe("aiChatPlugin", () => {
         ),
       );
       expect(forget.disabled).toBe(true);
+    });
+
+    /** The panel with Anthropic, which loads the tables computed by the chat */
+    async function panelWithComputedTables() {
+      // TissUUmaps loads a table only once something it shows uses it, as
+      // this data store, which never loads the computed tables
+      const panel = await openPanel(undefined, undefined, {
+        provider: "anthropic",
+      });
+      await panel.pasteKey(anthropicKey);
+      return panel;
+    }
+
+    /** Saves a column of numbers into the table "table", from JavaScript */
+    const saveColumn = (
+      column: string,
+      values: unknown = Array.from({ length: 2000 }, (_, i) => i % 7),
+      more: object = {},
+    ): Extract<ScriptQuestion, { kind: "save_column" }> => ({
+      kind: "save_column",
+      table: "table",
+      column,
+      values,
+      ...more,
+    });
+    const runSaving = (
+      title = "neighbors",
+    ): [string, Record<string, unknown>] => [
+      "run_code",
+      { title, code: countScript },
+    ];
+    const computedId = "ai-chat:tables/table";
+    const computedTable = (panel: { projectStore: ProjectStoreApi }) =>
+      panel.projectStore
+        .getState()
+        .tables.find((table) => table.id === computedId);
+
+    it("tells every model to offer only what its tools can do", async () => {
+      const rule = "Offer only what your tools can do.";
+      const panel = await openPanel();
+      await panel.say("Hello");
+      expect(ollama.requests[0]?.messages[0]?.content).toContain(rule);
+      const strong = await panelWithComputedTables();
+      services.answers = [{ content: "Hi." }];
+      await strong.say("Hello");
+      expect(JSON.stringify(services.requests.at(-1)?.body)).toContain(rule);
+    });
+
+    it("saves a column that code computed into a table (chat), which the colors use, and Undo takes it back", async () => {
+      const panel = await panelWithComputedTables();
+      const colorsBefore = panel.projectStore
+        .getState()
+        .labels.find((labels) => labels.id === cellLabels)?.labelColor;
+      sandbox.extra = [saveColumn("neighbors")];
+      services.answers = [
+        { toolCalls: [runSaving()] },
+        {
+          toolCalls: [
+            ["color_by_column", { ids: [cellLabels], column: "neighbors" }],
+          ],
+        },
+        { content: "The cells are colored by their neighbors." },
+      ];
+      await panel.say("Color the cells by the number of their neighbors.");
+      expect(sandbox.runs[0]?.answers.at(-1)).toEqual({
+        table: "table (chat)",
+        column: "neighbors",
+        rows: 2000,
+        values: "numbers",
+      });
+      expect(computedTable(panel)).toMatchObject({
+        name: "table (chat)",
+        dataSource: { type: "ai-chat" },
+      });
+      // the original table is not changed
+      expect(panel.projectStore.getState().tables[0]).toMatchObject({
+        id: "tables/table",
+        dataSource: { type: "anndata", source: "xenium.h5ad" },
+      });
+      expect(panel.texts("Table")).toEqual([
+        "📊 New column neighbors in table (chat) (7 groups: 0, 1, 2, 3, 4, 5, 6). It is temporary: it is lost when the page is reloaded, unless the table is kept as a CSV file.Keep as CSVDownload CSV",
+      ]);
+      expect(panel.texts("Tool")[1]).toContain("→ Done");
+      expect(
+        JSON.stringify(
+          panel.projectStore
+            .getState()
+            .labels.find((labels) => labels.id === cellLabels)?.labelColor,
+        ),
+      ).toContain(`"table":"${computedId}","column":"neighbors"`);
+
+      // the model knows the table in the next turns
+      services.answers = [{ content: "Yes." }];
+      await panel.say("Is it saved?");
+      expect(turnText("anthropic", services.requests.at(-1)?.body)).toContain(
+        `another table, ${computedId}, with rows for the same items; computed by the chat; temporary`,
+      );
+
+      // Undo takes back the colors, then the table
+      panel.button("Undo").click();
+      expect(computedTable(panel)).toBeUndefined();
+      expect(
+        panel.projectStore
+          .getState()
+          .labels.find((labels) => labels.id === cellLabels)?.labelColor,
+      ).toEqual(colorsBefore);
+      expect(panel.texts("Undo").at(-1)).toContain(
+        "table (chat) (the table computed by the chat is removed)",
+      );
+    });
+
+    it("saves more columns into the same table, also from Python and for some items only, and checks them", async () => {
+      const panel = await panelWithComputedTables();
+      sandbox.extra = [
+        saveColumn("neighbors"),
+        saveColumn("zone", ["edge", "core"], { ids: ["cell-1", "cell-2"] }),
+        saveColumn("id"),
+        saveColumn("short", [1, 2, 3]),
+        { ...saveColumn("x"), table: "nope" },
+      ];
+      services.answers = [{ toolCalls: [runSaving()] }, { content: "Saved." }];
+      await panel.say("Save the neighbors and the zones.");
+      const answers = sandbox.runs[0]?.answers.slice(-5);
+      expect(answers?.[1]).toMatchObject({ column: "zone", values: "text" });
+      expect(answers?.slice(2)).toEqual([
+        '"id" cannot be the name of a column: give a short name, without [ ], other than "id"',
+        'the table "table" has 2000 rows, but there are 3 values: give one value per row, in the order of tm.read, or give the ids of the values',
+        'there is no table "nope"; tm.tables() lists the tables',
+      ]);
+      python.extra = [
+        {
+          ...saveColumn(
+            "score",
+            Float64Array.from({ length: 2000 }, () => 1.5),
+          ),
+          table: "table (chat)",
+        },
+      ];
+      services.answers = [
+        { toolCalls: [runPython()] },
+        { content: "Saved from Python." },
+      ];
+      await panel.say("And a score, with Python.");
+      expect(python.runs[0]?.answers.at(-1)).toMatchObject({
+        table: "table (chat)",
+        column: "score",
+      });
+      // one table for the table "table", with the three columns
+      const provider = panel.appStore
+        .getState()
+        .tableDataProviders.get("ai-chat");
+      const data = await provider?.load(computedTable(panel)!.dataSource);
+      expect(
+        (await data!.suggestColumnQueries("")).map(({ query }) => query),
+      ).toEqual(["neighbors", "zone", "score"]);
+      const zones = await data!.loadValues<string>("zone");
+      expect([zones[0], zones[1], zones[2]]).toEqual(["edge", "core", ""]);
+    });
+
+    it("keeps a computed table as a CSV file next to the project, after asking", async () => {
+      const panel = await panelWithComputedTables();
+      const written = new Map<string, string>();
+      const writable = (path: string): unknown => ({
+        kind: "directory",
+        name: path.split("/").at(-1) || "root",
+        requestPermission: () => Promise.resolve("granted"),
+        values: () => ({
+          [Symbol.asyncIterator]: () => ({
+            next: () => Promise.resolve({ done: true, value: undefined }),
+          }),
+        }),
+        getDirectoryHandle: (name: string) =>
+          Promise.resolve(writable(`${path}/${name}`)),
+        getFileHandle: (name: string) =>
+          Promise.resolve({
+            createWritable: () =>
+              Promise.resolve({
+                write: (text: string) => {
+                  written.set(`${path}/${name}`, text);
+                  return Promise.resolve();
+                },
+                close: () => Promise.resolve(),
+              }),
+          }),
+      });
+      panel.appStore.setState({
+        workspace: writable("") as FileSystemDirectoryHandle,
+      });
+      panel.projectStore.openOtherProject({ source: "/xenium/project.json" });
+      sandbox.extra = [saveColumn("neighbors")];
+      services.answers = [{ toolCalls: [runSaving()] }, { content: "Saved." }];
+      await panel.say("Compute the neighbors.");
+
+      const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+      const keep = ["save_computed_table", { table: "table (chat)" }] as [
+        string,
+        Record<string, unknown>,
+      ];
+      services.answers = [{ toolCalls: [keep] }, { content: "Not kept." }];
+      await panel.say("Keep the table.");
+      expect(confirm.mock.calls[0]?.[0]).toContain(
+        'Save the table "table (chat)", computed by the chat, as the file computed/table-chat.csv next to the project file, in the folder "root"?',
+      );
+      expect(panel.texts("Tool").at(-1)).toContain(
+        'Error: the user did not want "table (chat)" to be saved as a file.',
+      );
+      expect(written.size).toBe(0);
+
+      confirm.mockReturnValue(true);
+      services.answers = [{ toolCalls: [keep] }, { content: "Kept." }];
+      await panel.say("Keep the table, I am sure.");
+      const csv = written.get("/xenium/computed/table-chat.csv") ?? "";
+      expect(csv.split("\n").slice(0, 3)).toEqual([
+        "id,neighbors",
+        "cell-1,0",
+        "cell-2,1",
+      ]);
+      expect(computedTable(panel)?.dataSource).toEqual({
+        type: "csv",
+        source: "computed/table-chat.csv",
+        idColumn: "id",
+      });
+      expect(panel.texts("Tool").at(-1)).toContain(
+        'Done: "table (chat)" was saved as computed/table-chat.csv next to the project file',
+      );
+      // Undo does not take back a table that is a file now
+      panel.button("Undo").click();
+      panel.button("Undo").click();
+      expect(panel.texts("Undo").at(-1)).toContain(
+        "table (chat) was kept as a CSV file, so it stays",
+      );
+      expect(computedTable(panel)?.dataSource.type).toBe("csv");
+    });
+
+    it("downloads a computed table as a CSV file when the project is not in a connected folder", async () => {
+      const panel = await panelWithComputedTables();
+      sandbox.extra = [saveColumn("neighbors")];
+      services.answers = [{ toolCalls: [runSaving()] }, { content: "Saved." }];
+      await panel.say("Compute the neighbors.");
+      const downloads: string[] = [];
+      URL.createObjectURL = vi.fn(() => "blob:table");
+      URL.revokeObjectURL = vi.fn();
+      vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(
+        function (this: HTMLAnchorElement) {
+          downloads.push(this.download);
+        },
+      );
+      panel.button("Download CSV").click();
+      expect(downloads).toEqual(["table-chat.csv"]);
+      expect(panel.texts("Note").at(-1)).toBe(
+        '"table (chat)" was downloaded as table-chat.csv, with the item IDs in the column "id". In TissUUmaps the table stays temporary.',
+      );
+      panel.button("Keep as CSV").click();
+      await vi.waitFor(() =>
+        expect(panel.texts("Error").at(-1)).toContain(
+          'the project was not opened from a connected folder, so "table (chat)" cannot be written next to it.',
+        ),
+      );
+      expect(computedTable(panel)?.dataSource.type).toBe("ai-chat");
     });
 
     it("offers no skills to Ollama", async () => {

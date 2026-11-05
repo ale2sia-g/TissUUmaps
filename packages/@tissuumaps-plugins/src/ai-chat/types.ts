@@ -45,18 +45,25 @@ export type ItemsTarget = { kind: ItemsKind; object: ItemsObject };
 export type Change = {
   /**
    * Without it, one property changed; "added": a map was added, which Undo
-   * deletes; "moved": an entry was moved to another index
+   * deletes; "moved": an entry was moved to another index; "computed": code
+   * saved a column into a table computed by the chat, whose data source was
+   * before and after the source of a version (before: none for a new table,
+   * which Undo deletes)
    */
-  type?: "added" | "moved";
+  type?: "added" | "moved" | "computed";
   /**
    * The list of the changed entry; "project" for a setting of the project
-   * itself, "app" for a setting of the view in the app store
+   * itself, "app" for a setting of the view in the app store, "tables" for
+   * a table computed by the chat
    */
-  kind: ListKind | "project" | "app";
+  kind: ListKind | "project" | "app" | "tables";
   /** The ID of the entry, or "" for the project and the app */
   id: string;
   name: string;
-  /** The property, or "index" for a move, or "" for an added map */
+  /**
+   * The property, or "index" for a move, or "" for an added map, or the
+   * column of a computed table
+   */
   property: string;
   before: unknown;
   after: unknown;
@@ -88,7 +95,7 @@ export type ToolContext = {
     skill: Skill,
     path: string,
     args: unknown,
-    options?: { signal?: AbortSignal; progress?: (text: string) => void },
+    options?: RunOptions,
   ) => Promise<string>;
   /**
    * Runs code that the model wrote in the sandbox, and shows it in the chat
@@ -99,8 +106,25 @@ export type ToolContext = {
     title: string,
     code: string,
     language: "javascript" | "python",
-    options?: { signal?: AbortSignal; progress?: (text: string) => void },
+    options?: RunOptions,
   ) => Promise<string>;
+  /**
+   * Keeps a table computed by the chat as a CSV file next to the project, after
+   * asking the user, or downloads it when it cannot
+   *
+   * @returns The result for the model
+   */
+  keepComputedTable: (table: string) => Promise<string>;
+};
+
+/** How code runs in the sandbox */
+export type RunOptions = {
+  /** Stops the code */
+  signal?: AbortSignal;
+  /** Shows how far it is, in a row of the chat */
+  progress?: (text: string) => void;
+  /** The changes of the current request, for the columns the code saves */
+  changes?: Change[];
 };
 
 /**
@@ -121,6 +145,8 @@ export type TableInfo =
   | { status: "error"; error: string }
   | {
       status: "ready";
+      /** e.g. that the table was computed by the chat, and is temporary */
+      note?: string;
       rows: number;
       tooBig: boolean;
       useful: ColumnInfo[];

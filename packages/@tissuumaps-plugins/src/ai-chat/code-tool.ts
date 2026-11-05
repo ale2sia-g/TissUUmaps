@@ -48,6 +48,28 @@ export const runCodeDefinition = {
   },
 };
 
+/** The save_computed_table tool, only offered to OpenAI and Anthropic */
+export const saveComputedTableDefinition = {
+  type: "function",
+  function: {
+    name: "save_computed_table",
+    description:
+      'Keep a table computed by the chat (e.g. "cells (chat)"), which is temporary, as a CSV file next to the project file, ' +
+      "after the user confirms; or download it, when the project was not opened from a connected folder. " +
+      "Only when the user asks to keep or save it.",
+    parameters: {
+      type: "object",
+      required: ["table"],
+      properties: {
+        table: {
+          type: "string",
+          description: 'The name of the table, e.g. "cells (chat)".',
+        },
+      },
+    },
+  },
+};
+
 /** What the strong models are told about run_code, with the fixed instructions */
 export const codeInstructions = [
   "# Your own code",
@@ -88,6 +110,23 @@ export const codeInstructions = [
   "  for text such as cluster names)",
   "- tm.project: a copy of the app state, the same JSON as in the context",
   "- tm.progress(text): shows how far it is, for long computations",
+  "- await tm.saveColumn(table, name, values) in JavaScript, await tm.save_column(table,",
+  "  name, values) in Python: saves a result as a column, one value per row of the table, in",
+  "  the order of tm.read (or with the item IDs of the values: { ids } in JavaScript, ids=",
+  '  in Python, for some of the items only), into the table "<table> (chat)", which the',
+  "  chat makes for it",
+  "",
+  "# Results on the image",
+  "To show a result on the image, e.g. to color the cells by the number of their",
+  "neighbors, or to show only the cells near a cluster, save it with tm.saveColumn (or",
+  "tm.save_column) in the same code, then use your tools with that column like any other,",
+  "e.g. color_by_column with its name: numbers get a color scale, text gets one color per",
+  'group. To filter (show_only_groups), save groups as text, e.g. "near" and "far". A',
+  "saved column never changes the data of the project, and Undo takes it back. It is",
+  "temporary: it is lost when the page is reloaded, unless the user keeps the table with",
+  "save_computed_table, which writes it as a CSV file next to the project file (or",
+  "downloads it). Say so when you save one. At most 20 columns can be saved in all.",
+  "",
   "Use the table ids or names and the column names of the summary, or list them with",
   "tm.tables() and tm.columns() first. Tell the user which method you used, e.g. which",
   "test. The code may run for at most two minutes (in Python, the start and the download do",
@@ -98,9 +137,8 @@ export const codeInstructions = [
   "is text: give the numbers, or a small table, in your answer). The code has no internet:",
   "it cannot download anything, and in Python only the packages of Pyodide can be imported",
   "(no pip or micropip, and no packages such as squidpy or scanpy). It cannot change the",
-  "project, add columns to the tables or save files; to show what it found, use your tools,",
-  "e.g. show only the groups it found. When a request needs one of these, say so, and offer",
-  "what you can do instead.",
+  "data of the project or save files: it can only save columns with tm.saveColumn. When a",
+  "request needs one of these, say so, and offer what you can do instead.",
   "Return a small result (counts, summaries, a small DataFrame, at most a few hundred",
   "values), never whole columns: it comes back to you as text, and what the code logs with",
   "console.log or print comes along. The code runs in a sandbox: no network, and it cannot",
@@ -144,6 +182,27 @@ export async function runCodeTool(
     title.length > maxTitle ? `${title.slice(0, maxTitle - 1)}…` : title,
     code,
     python ? "python" : "javascript",
-    { signal, progress: context.progress },
+    { signal, progress: context.progress, changes: context.changes },
   );
+}
+
+/**
+ * Runs the save_computed_table tool: lets the panel keep a table computed by
+ * the chat as a CSV file, or download it
+ *
+ * @param args - The arguments of the tool call
+ * @param context - How to keep a table
+ * @returns The result for the model
+ */
+export function saveComputedTableTool(
+  args: ToolArguments,
+  context: ToolContext,
+): Promise<string> {
+  const table = args["table"];
+  if (typeof table !== "string" || table.trim() === "") {
+    return Promise.resolve(
+      'Error: give the name of the table, e.g. "cells (chat)".',
+    );
+  }
+  return context.keepComputedTable(table.trim());
 }

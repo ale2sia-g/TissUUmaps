@@ -271,9 +271,11 @@ function describeTableColumns(
   info: TableInfo | undefined,
 ): string[] {
   const own = tableId === annotatingTable(object);
+  const note =
+    info?.status === "ready" && info.note !== undefined ? `; ${info.note}` : "";
   const which = own
-    ? `table ${tableId}`
-    : `another table, ${tableId}, with rows for the same items`;
+    ? `table ${tableId}${note}`
+    : `another table, ${tableId}, with rows for the same items${note}`;
   if (info === undefined) {
     return [`  - columns: the table ${tableId} is not loaded yet`];
   }

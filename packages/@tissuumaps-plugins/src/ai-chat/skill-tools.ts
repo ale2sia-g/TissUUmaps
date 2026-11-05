@@ -274,5 +274,6 @@ export async function runScriptTool(
   return context.runSkillScript(skill, path, args["args"] ?? {}, {
     signal,
     progress: context.progress,
+    changes: context.changes,
   });
 }

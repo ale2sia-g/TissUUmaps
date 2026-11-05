@@ -1,8 +1,34 @@
-import type { PluginStores, ProjectStore } from "@tissuumaps/core";
+import {
+  type PluginStores,
+  type ProjectStore,
+  SourceUtils,
+  type TableDataSource,
+  createTable,
+} from "@tissuumaps/core";
 
 import { callActionDefinition, describeAction } from "./call-action";
-import { codeInstructions, runCodeDefinition } from "./code-tool";
+import {
+  codeInstructions,
+  runCodeDefinition,
+  saveComputedTableDefinition,
+} from "./code-tool";
 import { overlapWarning } from "./color-tools";
+import {
+  type ComputedTable,
+  type ComputedValues,
+  columnValues,
+  computedTableCsv,
+  computedTableType,
+  csvFileName,
+  forgetVersions,
+  idsSurviveCsv,
+  keepVersion,
+  maxComputedColumns,
+  registerComputedTables,
+  valuesByRow,
+  versionOf,
+  withComputedTables,
+} from "./computed-tables";
 import { helpText } from "./help";
 import {
   actionLimits,
@@ -65,6 +91,7 @@ import type {
   Change,
   ColumnInfo,
   ItemsObject,
+  RunOptions,
   TableInfo,
   TableKnowledge,
   ToolArguments,
@@ -108,8 +135,15 @@ const maxScriptText = 20_000;
  */
 export function mountAiChat(
   container: HTMLElement,
-  { projectStore, dataStore, settingsStore, appStore }: PluginStores,
+  {
+    projectStore,
+    dataStore: appDataStore,
+    settingsStore,
+    appStore,
+  }: PluginStores,
 ): () => void {
+  // with the tables computed by the chat, which the tools must find at once
+  const dataStore = withComputedTables(appDataStore, projectStore);
   // aborted on unmount, which stops the requests to the model and the table reads
   const abortController = new AbortController();
   const { signal } = abortController;
@@ -467,8 +501,16 @@ export function mountAiChat(
           other++;
         }
       }
+      const computed =
+        projectStore.getState().tables.find(({ id }) => id === tableId)
+          ?.dataSource.type === computedTableType;
       saveTableInfo(tableId, projectId, {
         status: "ready",
+        ...(computed
+          ? {
+              note: "computed by the chat; temporary: lost when the page is reloaded, unless kept with save_computed_table",
+            }
+          : {}),
         rows,
         tooBig,
         useful,
@@ -825,8 +867,13 @@ export function mountAiChat(
     for (const change of [...changes].reverse()) {
       const now = currentValue(change, projectStore, appStore);
       if (now === undefined) {
+        const kept =
+          change.type === "computed" &&
+          projectStore.getState().tables.some(({ id }) => id === change.id);
         lines.push(
-          `${change.name} is not in the project any more, so it was skipped`,
+          kept
+            ? `${change.name} was kept as a CSV file, so it stays`
+            : `${change.name} is not in the project any more, so it was skipped`,
         );
         continue;
       }
@@ -841,6 +888,7 @@ export function mountAiChat(
       }
       lines.push(line);
     }
+    forgetGoneComputedTables();
     rereadTables(changes);
     return [...new Set(lines)];
   }
@@ -943,6 +991,14 @@ export function mountAiChat(
     }
     // Python may hold data of the other project
     stopPython();
+    // the computed tables of the other project, unless this one has them too
+    forgetVersions(
+      new Set(
+        state.tables
+          .filter(({ dataSource }) => dataSource.type === computedTableType)
+          .map(({ dataSource }) => dataSource.source ?? ""),
+      ),
+    );
     tables.info.clear();
     tables.remembered.clear();
     readTables();
@@ -1294,7 +1350,12 @@ export function mountAiChat(
     return [
       ...toolDefinitions,
       ...(provider.wholeApp
-        ? [callActionDefinition, ...skillToolDefinitions, runCodeDefinition]
+        ? [
+            callActionDefinition,
+            ...skillToolDefinitions,
+            runCodeDefinition,
+            saveComputedTableDefinition,
+          ]
         : []),
     ].map((definition) => definition.function);
   }
@@ -1412,17 +1473,21 @@ export function mountAiChat(
    * @param question - What the script asks for, through tm
    * @param skill - The skill of the script, for tm.readFile; none for the
    * code of the model
-   * @param options - Optional abort signal
+   * @param options - Optional abort signal, and the changes of the request,
+   * for the columns that the script saves
    * @returns The answer
    * @throws If the question cannot be answered, e.g. an unknown table
    */
   async function answerScript(
     question: ScriptQuestion,
     skill: Skill | undefined,
-    options?: { signal?: AbortSignal },
+    options?: { signal?: AbortSignal; changes?: Change[] },
   ): Promise<unknown> {
-    const { signal: stop } = options ?? {};
+    const { signal: stop, changes } = options ?? {};
     stop?.throwIfAborted();
+    if (question.kind === "save_column") {
+      return saveComputedColumn(question, changes, { signal: stop });
+    }
     if (question.kind === "tables") {
       return projectStore
         .getState()
@@ -1473,6 +1538,358 @@ export function mountAiChat(
     const values = await data.loadValues(question.column, { signal: stop });
     // a copy of these values only, not of a buffer they may share
     return values.slice();
+  }
+
+  /**
+   * Saves a column that code computed, one value per row of a table, into the
+   * table "(chat)" of that table: a new version of it, so that TissUUmaps reads
+   * the values again, and a change that Undo takes back. The original table
+   * is never changed.
+   *
+   * @param question - The table, the name of the column, the values, and the
+   * item IDs of the values if they are not one per row
+   * @param changes - The changes of the request
+   * @param options - Optional abort signal
+   * @returns What was saved, for the code
+   * @throws If the column cannot be saved, with the reason for the code
+   */
+  async function saveComputedColumn(
+    question: Extract<ScriptQuestion, { kind: "save_column" }>,
+    changes: Change[] | undefined,
+    options?: { signal?: AbortSignal },
+  ): Promise<unknown> {
+    const { signal: stop } = options ?? {};
+    if (changes === undefined) {
+      throw new Error("columns can only be saved while the chat runs code");
+    }
+    const project = projectStore.getState();
+    const given = project.tables.find(
+      ({ id, name }) => id === question.table || name === question.table,
+    );
+    if (given === undefined) {
+      throw new Error(
+        `there is no table "${question.table}"; tm.tables() lists the tables`,
+      );
+    }
+    // a table computed by the chat stands for its original table
+    const originId = versionOf(given.dataSource.source)?.originId ?? given.id;
+    const origin = project.tables.find(({ id }) => id === originId);
+    const column =
+      typeof question.column === "string" ? question.column.trim() : "";
+    if (
+      column === "" ||
+      column.length > 60 ||
+      /[[\]\r\n]/.test(column) ||
+      column.toLowerCase() === "id"
+    ) {
+      throw new Error(
+        `${JSON.stringify(question.column)} cannot be the name of a column: give a short name, without [ ], other than "id"`,
+      );
+    }
+    const tableRef = dataStore.getState().tableDataRefs.get(originId);
+    if (origin === undefined || tableRef === undefined) {
+      throw new Error(`the table "${question.table}" is not loaded`);
+    }
+    const data = await tableRef.promise;
+    stop?.throwIfAborted();
+    const rows = data.getSize();
+    if (rows > maxRowsToRead) {
+      throw new Error(
+        `the table "${origin.name}" has ${rows} rows, too many for a computed column (at most ${maxRowsToRead})`,
+      );
+    }
+    const values = columnValues(question.values);
+    const byRow =
+      typeof values === "string" || question.ids === undefined
+        ? values
+        : valuesByRow(data.getIds(), question.ids, values);
+    if (typeof byRow === "string") {
+      throw new Error(byRow);
+    }
+    if (byRow.length !== rows) {
+      throw new Error(
+        `the table "${origin.name}" has ${rows} rows, but there are ${byRow.length} values: give one value per row, in the order of tm.read, or give the ids of the values`,
+      );
+    }
+    const tableId = `${computedTableType}:${originId}`;
+    const existing = project.tables.find(({ id }) => id === tableId);
+    if (
+      existing !== undefined &&
+      existing.dataSource.type !== computedTableType
+    ) {
+      throw new Error(
+        `the table "${existing.name}" was kept as a CSV file, so the chat cannot add columns to it`,
+      );
+    }
+    const previous = versionOf(existing?.dataSource.source);
+    const saved = project.tables
+      .filter(({ dataSource }) => dataSource.type === computedTableType)
+      .reduce(
+        (count, table) =>
+          count + (versionOf(table.dataSource.source)?.columns.size ?? 0),
+        0,
+      );
+    if (
+      !(previous?.columns.has(column) ?? false) &&
+      saved >= maxComputedColumns
+    ) {
+      throw new Error(
+        `the tables computed by the chat have ${maxComputedColumns} columns already, the most there can be: tell the user, who can take some back with Undo`,
+      );
+    }
+    const columns = new Map(previous?.columns);
+    columns.set(column, byRow);
+    const source = keepVersion({
+      originId,
+      ids: data.getIds(),
+      names: data.getNames?.(),
+      columns,
+    });
+    const name = existing?.name ?? `${origin.name} (chat)`;
+    if (existing === undefined) {
+      project.addTable(
+        createTable({
+          id: tableId,
+          name,
+          dataSource: { type: computedTableType, source },
+        }),
+      );
+    } else {
+      project.updateTable(tableId, {
+        dataSource: { ...existing.dataSource, source },
+      });
+    }
+    changes.push({
+      type: "computed",
+      kind: "tables",
+      id: tableId,
+      name,
+      property: column,
+      before: existing?.dataSource.source,
+      after: source,
+    });
+    linkComputedTable(originId, tableId);
+    showComputedColumn(tableId, name, column, byRow);
+    return {
+      table: name,
+      column,
+      rows,
+      values: byRow instanceof Float64Array ? "numbers" : "text",
+    };
+  }
+
+  /**
+   * Lets the labels and points that use a table use its table "(chat)" too,
+   * and has the panel read it again
+   *
+   * @param originId - The original table
+   * @param tableId - The table computed by the chat
+   */
+  function linkComputedTable(originId: string, tableId: string): void {
+    const project = projectStore.getState();
+    for (const object of [...project.labels, ...project.points]) {
+      if (objectTables(object, tables).includes(originId)) {
+        const remembered = tables.remembered.get(object.id) ?? new Set();
+        remembered.add(tableId);
+        tables.remembered.set(object.id, remembered);
+      }
+    }
+    tables.info.delete(tableId);
+    readTables();
+  }
+
+  /** Forgets the tables computed by the chat that are not in the project any more */
+  function forgetGoneComputedTables(): void {
+    const ids = new Set(projectStore.getState().tables.map(({ id }) => id));
+    for (const remembered of tables.remembered.values()) {
+      for (const tableId of remembered) {
+        if (tableId.startsWith(`${computedTableType}:`) && !ids.has(tableId)) {
+          remembered.delete(tableId);
+        }
+      }
+    }
+  }
+
+  /**
+   * Shows in the chat that code saved a column, with buttons to keep its table
+   * as a CSV file or to download it
+   *
+   * @param tableId - The table computed by the chat
+   * @param tableName - Its name
+   * @param column - The column
+   * @param values - Its values
+   */
+  function showComputedColumn(
+    tableId: string,
+    tableName: string,
+    column: string,
+    values: ComputedValues,
+  ): void {
+    const body = addFrame("Table", "note");
+    const what = describeValues(values)?.text ?? "the same value in every row";
+    const line = document.createElement("div");
+    line.textContent =
+      `📊 New column ${column} in ${tableName} (${what}). It is temporary: ` +
+      "it is lost when the page is reloaded, unless the table is kept as a CSV file.";
+    const buttons = document.createElement("div");
+    buttons.style.cssText = "display: flex; gap: 6px; margin-top: 4px;";
+    const keep = makeButton(
+      "Keep as CSV",
+      () => void keepComputedTable(tableId).then(reportKept),
+      smallButtonStyle,
+    );
+    keep.title =
+      "Write the table as a CSV file next to the project file, in the connected folder";
+    const download = makeButton(
+      "Download CSV",
+      () => reportKept(downloadComputedTable(tableId)),
+      smallButtonStyle,
+    );
+    download.title = "Download the table as a CSV file";
+    buttons.append(keep, download);
+    body.append(line, buttons);
+  }
+
+  /** Shows what keeping or downloading a computed table did */
+  function reportKept(result: string): void {
+    show(
+      result.startsWith("Error") ? "Error" : "Note",
+      result.replace(/^(Error|Done): /, ""),
+    );
+  }
+
+  /**
+   * Finds a table computed by the chat, by its name or ID
+   *
+   * @param wanted - The name or ID
+   * @returns The table and its values, or the error for the model
+   */
+  function findComputedTable(
+    wanted: string,
+  ):
+    | { error: string }
+    | { table: ProjectStore["tables"][number]; version: ComputedTable } {
+    const table = projectStore
+      .getState()
+      .tables.find(({ id, name }) => id === wanted || name === wanted);
+    const version = versionOf(table?.dataSource.source);
+    if (table === undefined || table.dataSource.type !== computedTableType) {
+      return {
+        error: `Error: there is no temporary table computed by the chat called "${wanted}"${table === undefined ? "" : " (it was kept as a CSV file already)"}.`,
+      };
+    }
+    if (version === undefined) {
+      return {
+        error: `Error: the values of "${table.name}" are gone: it was computed in an earlier session. Compute it again.`,
+      };
+    }
+    return { table, version };
+  }
+
+  /**
+   * Keeps a table computed by the chat as a CSV file next to the project file,
+   * after asking the user; then the project reads it from that file, also
+   * once saved and opened again, even without the chat
+   *
+   * @param wanted - The name or ID of the table
+   * @returns The result for the model
+   */
+  async function keepComputedTable(wanted: string): Promise<string> {
+    const found = findComputedTable(wanted);
+    if ("error" in found) {
+      return found.error;
+    }
+    const { table, version } = found;
+    const workspace = appStore.getState().workspace ?? null;
+    const projectSource = projectStore.getState().source;
+    const fileName = csvFileName(table.name);
+    const where =
+      projectSource === null
+        ? undefined
+        : SourceUtils.normalizeSource(
+            `computed/${fileName}`,
+            workspace,
+            projectSource,
+          );
+    if (
+      workspace === null ||
+      where === undefined ||
+      !SourceUtils.isWorkspacePath(where)
+    ) {
+      return `Error: the project was not opened from a connected folder, so "${table.name}" cannot be written next to it. ${downloadComputedTable(table.id).replace(/^Done: /, "Instead: ")}`;
+    }
+    if (!idsSurviveCsv(version.ids)) {
+      return `Error: the item IDs of "${table.name}" are text that looks like numbers, which a CSV file would turn into numbers, so the table would not match its items any more. It stays temporary.`;
+    }
+    const allowed = window.confirm(
+      `Save the table "${table.name}", computed by the chat, as the file computed/${fileName} next to the project file, in the folder "${workspace.name}"?\n\n` +
+        "Then the project reads the table from that file, also after it is saved and opened again.",
+    );
+    if (!allowed) {
+      return `Error: the user did not want "${table.name}" to be saved as a file. It stays temporary; do not ask again unless the user does.`;
+    }
+    try {
+      const folder = workspace as FileSystemDirectoryHandle & {
+        requestPermission?: (options: {
+          mode: "readwrite";
+        }) => Promise<PermissionState>;
+      };
+      if (
+        folder.requestPermission !== undefined &&
+        (await folder.requestPermission({ mode: "readwrite" })) !== "granted"
+      ) {
+        return `Error: the browser was not allowed to write into the folder "${workspace.name}", so "${table.name}" stays temporary.`;
+      }
+      const segments = SourceUtils.getPathSegments(where);
+      let directory: FileSystemDirectoryHandle = workspace;
+      for (const [index, segment] of segments.slice(0, -1).entries()) {
+        directory = await directory.getDirectoryHandle(segment, {
+          // only the folder "computed" is made
+          create: index === segments.length - 2,
+        });
+      }
+      const file = await directory.getFileHandle(fileName, { create: true });
+      const writable = await file.createWritable();
+      await writable.write(computedTableCsv(version));
+      await writable.close();
+    } catch (error) {
+      return `Error: "${table.name}" could not be written: ${error instanceof Error ? error.message : String(error)}. It stays temporary.`;
+    }
+    projectStore.getState().updateTable(table.id, {
+      dataSource: {
+        type: "csv",
+        source: `computed/${fileName}`,
+        idColumn: "id",
+      } as TableDataSource,
+    });
+    tables.info.delete(table.id);
+    readTables();
+    return `Done: "${table.name}" was saved as computed/${fileName} next to the project file, and the project now reads it from there. Save the project to keep this; the table is not temporary any more, and Undo does not take it back.`;
+  }
+
+  /**
+   * Downloads a table computed by the chat as a CSV file, with the item IDs
+   * in the column "id"
+   *
+   * @param wanted - The name or ID of the table
+   * @returns The result for the model
+   */
+  function downloadComputedTable(wanted: string): string {
+    const found = findComputedTable(wanted);
+    if ("error" in found) {
+      return found.error;
+    }
+    const { table, version } = found;
+    const fileName = csvFileName(table.name);
+    const url = URL.createObjectURL(
+      new Blob([computedTableCsv(version)], { type: "text/csv" }),
+    );
+    const link = document.createElement("a");
+    link.download = fileName;
+    link.href = url;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    return `Done: "${table.name}" was downloaded as ${fileName}, with the item IDs in the column "id". In TissUUmaps the table stays temporary.`;
   }
 
   /**
@@ -1540,7 +1957,7 @@ export function mountAiChat(
     skill: Skill,
     path: string,
     args: unknown,
-    options?: { signal?: AbortSignal; progress?: (text: string) => void },
+    options?: RunOptions,
   ): Promise<string> {
     const { signal: stop } = options ?? {};
     stop?.throwIfAborted();
@@ -1592,7 +2009,7 @@ export function mountAiChat(
     title: string,
     code: string,
     language: "javascript" | "python",
-    options?: { signal?: AbortSignal; progress?: (text: string) => void },
+    options?: RunOptions,
   ): Promise<string> {
     options?.signal?.throwIfAborted();
     const python = language === "python";
@@ -1655,9 +2072,9 @@ export function mountAiChat(
     skill: Skill | undefined,
     names: { short: string; full: string },
     source: string,
-    options?: { signal?: AbortSignal; progress?: (text: string) => void },
+    options?: RunOptions,
   ): Promise<string> {
-    const { signal: stop, progress } = options ?? {};
+    const { signal: stop, progress, changes } = options ?? {};
     let step = "starting Python";
     let started: number | undefined;
     let reported = "";
@@ -1697,7 +2114,7 @@ export function mountAiChat(
             stateJson(projectStore.getState(), appStore.getState()),
           ) as unknown,
         },
-        (question) => answerScript(question, skill, { signal: stop }),
+        (question) => answerScript(question, skill, { signal: stop, changes }),
         {
           timeLimit: scriptTimeLimit,
           signal: stop,
@@ -1738,9 +2155,9 @@ export function mountAiChat(
     args: unknown,
     skill: Skill | undefined,
     names: { short: string; full: string },
-    options?: { signal?: AbortSignal; progress?: (text: string) => void },
+    options?: RunOptions,
   ): Promise<string> {
-    const { signal: stop, progress } = options ?? {};
+    const { signal: stop, progress, changes } = options ?? {};
     const started = Date.now();
     let reported = "";
     const update = () =>
@@ -1758,7 +2175,7 @@ export function mountAiChat(
             stateJson(projectStore.getState(), appStore.getState()),
           ) as unknown,
         },
-        (question) => answerScript(question, skill, { signal: stop }),
+        (question) => answerScript(question, skill, { signal: stop, changes }),
         {
           timeLimit: scriptTimeLimit,
           signal: stop,
@@ -1835,6 +2252,7 @@ export function mountAiChat(
           progress,
           runSkillScript,
           runCode,
+          keepComputedTable,
         },
         { signal: stopper.signal },
       );
@@ -2095,6 +2513,8 @@ export function mountAiChat(
   });
   observer.observe(container);
 
+  // TissUUmaps loads the tables computed by the chat from memory
+  registerComputedTables(appStore);
   const unsubscribeData = dataStore.subscribe(readTables);
   const unsubscribeProject = projectStore.subscribe(onProjectChange);
   const unsubscribeProjectSkills = projectStore.subscribe(readProjectSkills);

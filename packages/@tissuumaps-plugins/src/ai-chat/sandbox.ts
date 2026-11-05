@@ -14,7 +14,14 @@ export type ScriptQuestion =
   | { kind: "tables" }
   | { kind: "columns"; table: string; matrix?: string }
   | { kind: "values"; table: string; column: string }
-  | { kind: "file"; path: string };
+  | { kind: "file"; path: string }
+  | {
+      kind: "save_column";
+      table: string;
+      column: string;
+      values: unknown;
+      ids?: unknown;
+    };
 
 /** A script to run */
 export type ScriptRun = {
@@ -111,6 +118,19 @@ function workerMain(load: (url: string) => Promise<unknown>): void {
       read: (table: string, column: string) =>
         ask({ kind: "values", table, column }),
       readFile: (path: string) => ask({ kind: "file", path }),
+      saveColumn: (
+        table: string,
+        column: string,
+        values: unknown,
+        options?: { ids?: unknown },
+      ) =>
+        ask({
+          kind: "save_column",
+          table,
+          column,
+          values,
+          ...(options?.ids === undefined ? {} : { ids: options.ids }),
+        }),
       progress: (text: unknown) =>
         port.postMessage({ type: "progress", text: toText(text) }),
     });

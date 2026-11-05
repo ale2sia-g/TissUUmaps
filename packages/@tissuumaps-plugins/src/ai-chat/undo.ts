@@ -6,6 +6,7 @@ import {
   setProjectSetting,
   setView,
 } from "./call-action";
+import { computedTableType } from "./computed-tables";
 import { applyUpdate, findById, isMapKind, round } from "./objects";
 import type { Change } from "./types";
 
@@ -29,6 +30,11 @@ export function describeValueChange(
 ): string {
   if (change.type === "added") {
     return `${change.name} (the map added by the chat is deleted)`;
+  }
+  if (change.type === "computed") {
+    return change.before === undefined
+      ? `${change.name} (the table computed by the chat is removed)`
+      : `${change.name}: the column ${change.property} is taken back`;
   }
   if (change.type === "moved") {
     return `${change.name} back at position ${Number(to) + 1}`;
@@ -83,6 +89,13 @@ export function currentValue(
   appStore: AppStoreApi,
 ): { value: unknown } | undefined {
   const project = projectStore.getState();
+  if (change.type === "computed" || change.kind === "tables") {
+    // a computed table kept as a CSV file is not the chat's any more
+    const table = project.tables.find(({ id }) => id === change.id);
+    return table?.dataSource.type === computedTableType
+      ? { value: table.dataSource.source }
+      : undefined;
+  }
   if (change.kind === "project" || change.kind === "app") {
     const state: object =
       change.kind === "project" ? project : appStore.getState();
@@ -119,7 +132,16 @@ export function takeBack(
   appStore: AppStoreApi,
 ): void {
   const project = projectStore.getState();
-  if (change.kind === "project") {
+  if (change.type === "computed" || change.kind === "tables") {
+    const table = project.tables.find(({ id }) => id === change.id);
+    if (change.before === undefined) {
+      project.deleteTable(change.id);
+    } else if (table !== undefined) {
+      project.updateTable(change.id, {
+        dataSource: { ...table.dataSource, source: change.before as string },
+      });
+    }
+  } else if (change.kind === "project") {
     setProjectSetting(project, change.property, change.before);
   } else if (change.kind === "app") {
     setView(appStore.getState(), change.property, change.before);
