@@ -26,6 +26,7 @@ import {
 
 import { aiChatPlugin } from ".";
 import { thinkingWords } from "./persona";
+import type { PythonRun } from "./python-sandbox";
 import type { ScriptQuestion, ScriptRun } from "./sandbox";
 import { storeTypes } from "./store-types.generated";
 
@@ -110,6 +111,8 @@ const python = vi.hoisted(() => {
     files: number;
     /** More questions the code asks, e.g. to save a column */
     extra: ScriptQuestion[];
+    /** The charts that the code draws */
+    charts: { png: ArrayBuffer; description: string }[];
     onDownload?: (progress?: { done: number; total: number }) => void;
   } = {
     starts: 0,
@@ -119,6 +122,7 @@ const python = vi.hoisted(() => {
     startHangs: false,
     files: 0,
     extra: [],
+    charts: [],
   };
   return state;
 });
@@ -127,11 +131,28 @@ const untilAborted = (signal?: AbortSignal) =>
     signal?.addEventListener("abort", () => reject(signal.reason as Error)),
   );
 vi.mock("./python-files", () => ({
+  lockFile: "pyodide-lock.json",
   makePythonFiles: (
     onDownload: (progress?: { done: number; total: number }) => void,
   ) => {
     python.onDownload = onDownload;
-    return { get: () => Promise.reject(new Error("no files in the tests")) };
+    return {
+      // only the list of the packages, for the skills from GitHub
+      get: (name: string) =>
+        name === "pyodide-lock.json"
+          ? Promise.resolve(
+              new TextEncoder().encode(
+                JSON.stringify({
+                  packages: {
+                    numpy: { name: "numpy", imports: ["numpy"] },
+                    scipy: { name: "scipy", imports: ["scipy"] },
+                    pandas: { name: "pandas", imports: ["pandas"] },
+                  },
+                }),
+              ).buffer,
+            )
+          : Promise.reject(new Error("no files in the tests")),
+    };
   },
   countPythonFiles: () => Promise.resolve(python.files),
   forgetPythonFiles: () => {
@@ -194,11 +215,29 @@ vi.mock("./python-sandbox", () => ({
         return {
           result: `${(answers[0] as unknown[]).length} tables`,
           logs: ["hello from Python"],
+          ...(python.charts.length > 0 ? { charts: python.charts } : {}),
         };
       },
     };
   },
 }));
+
+/**
+ * A small PNG image, as matplotlib writes one: its signature, the chunk with
+ * its size, and the chunk that ends it (the pixels do not matter here)
+ */
+function pngImage(width: number, height: number): ArrayBuffer {
+  const bytes = new Uint8Array(8 + 25 + 12);
+  bytes.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const view = new DataView(bytes.buffer);
+  view.setUint32(8, 13);
+  bytes.set([0x49, 0x48, 0x44, 0x52], 12);
+  view.setUint32(16, width);
+  view.setUint32(20, height);
+  bytes.set([8, 6, 0, 0, 0], 24);
+  bytes.set([0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82], 33);
+  return bytes.buffer;
+}
 
 /** The ids of the objects of the fake project */
 const cellLabels = "labels/cell_labels@global";
@@ -904,7 +943,55 @@ function fakeService(url: URL, options?: RequestInit): Promise<Response> {
   return Promise.resolve(openAi ? fakeOpenAi() : fakeAnthropic(body));
 }
 
-/** The fake services: OpenAI, Anthropic and the Ollama server */
+/** The fake GitHub: one repository, lab/tools, at one commit */
+const gitHub: {
+  files: Record<string, string>;
+  license: { spdx_id: string; name: string } | null;
+} = { files: {}, license: null };
+const gitHubCommit = "a7e9fa555837a46ee47a02d7f6e4a70cb3892b0a";
+
+/** The answers of the fake GitHub: its API, and its raw files */
+function fakeGitHub(address: URL): Promise<Response> {
+  const path = address.pathname;
+  if (address.host === "raw.githubusercontent.com") {
+    const prefix = `/lab/tools/${gitHubCommit}/`;
+    const text = path.startsWith(prefix)
+      ? gitHub.files[decodeURIComponent(path.slice(prefix.length))]
+      : undefined;
+    return Promise.resolve(
+      text === undefined
+        ? new Response("", { status: 404 })
+        : new Response(text),
+    );
+  }
+  if (path === "/repos/lab/tools") {
+    return Promise.resolve(
+      Response.json({
+        full_name: "lab/tools",
+        default_branch: "main",
+        description: "Neighborhood tools",
+        license: gitHub.license,
+      }),
+    );
+  }
+  if (path === "/repos/lab/tools/commits") {
+    return Promise.resolve(Response.json([{ sha: gitHubCommit }]));
+  }
+  if (path === `/repos/lab/tools/git/trees/${gitHubCommit}`) {
+    return Promise.resolve(
+      Response.json({
+        tree: Object.entries(gitHub.files).map(([file, text]) => ({
+          path: file,
+          type: "blob",
+          size: text.length,
+        })),
+      }),
+    );
+  }
+  return Promise.resolve(new Response("", { status: 404 }));
+}
+
+/** The fake services: OpenAI, Anthropic, GitHub and the Ollama server */
 function fakeFetch(
   url: string | URL,
   options?: RequestInit,
@@ -915,6 +1002,9 @@ function fakeFetch(
     headers: new Headers(options?.headers),
     body: typeof options?.body === "string" ? options.body : "",
   });
+  if (["api.github.com", "raw.githubusercontent.com"].includes(address.host)) {
+    return fakeGitHub(address);
+  }
   if (["api.openai.com", "api.anthropic.com"].includes(address.host)) {
     return fakeService(address, options);
   }
@@ -3381,6 +3471,7 @@ describe("aiChatPlugin", () => {
         startHangs: false,
         files: 0,
         extra: [],
+        charts: [],
       });
     });
 
@@ -3566,6 +3657,7 @@ describe("aiChatPlugin", () => {
         "counter/SKILL.md": counter,
         "counter/scripts/count.js": countScript,
         "counter/scripts/count.py": "print(1)",
+        "counter/notes.txt": "Counts.",
       });
       sandbox.behavior = "hang";
       services.answers = [
@@ -3599,23 +3691,106 @@ describe("aiChatPlugin", () => {
         {
           toolCalls: [
             ["run_script", { skill: "counter", path: "scripts/count.js" }],
-            ["run_script", { skill: "counter", path: "scripts/count.py" }],
+            ["run_script", { skill: "counter", path: "notes.txt" }],
             ["run_script", { skill: "counter", path: "scripts/other.js" }],
           ],
         },
         { content: "Done." },
       ];
       await panel.say("Count them again.");
-      const [tooLong, python, missing] = panel.texts("Tool").slice(1);
+      const [tooLong, notScript, missing] = panel.texts("Tool").slice(1);
       expect(tooLong).toContain(
         "Error: the script took longer than 120 seconds, and was stopped",
       );
-      expect(python).toContain(
-        'Error: "scripts/count.py" is a Python script, and only JavaScript scripts can run for now.',
+      expect(notScript).toContain(
+        'Error: "notes.txt" is not a script (.js or .py), so it cannot run.',
       );
       expect(missing).toContain(
         'Error: the skill "counter" has no file "scripts/other.js". Its scripts: scripts/count.js, scripts/count.py.',
       );
+    });
+
+    it("runs the Python scripts of a skill with its files, in a Python of their own for a skill of the project", async () => {
+      const pyScript =
+        "from tools.count import count\n\nasync def main(tm):\n    return count(await tm.tables())";
+      const pyCounter = counter.replace("scripts/count.js", "scripts/count.py");
+      const panel = await panelWithSkills();
+      await addSkills(panel.container, {
+        "counter/SKILL.md": pyCounter,
+        "counter/scripts/count.py": pyScript,
+        "counter/tools/count.py": "def count(items):\n    return len(items)",
+      });
+      const runPy = (): [string, Record<string, unknown>] => [
+        "run_script",
+        { skill: "counter", path: "scripts/count.py", args: { k: 5 } },
+      ];
+      services.answers = [
+        { toolCalls: [runPy()] },
+        { toolCalls: [runPython()] },
+        { content: "1 table." },
+      ];
+      await panel.say("Count the tables.");
+      expect(scriptRows(panel.container)).toEqual([
+        { line: "📜 counter/scripts/count.py", open: false },
+        { line: "📜 Dia's code: tables (Python)", open: false },
+      ]);
+      expect(panel.texts("Tool")[0]).toMatch(
+        /^run_script\(skill: counter, path: scripts\/count\.py, args: \{"k":5\}\)\n→ Done: ran scripts\/count\.py of the skill "counter" in \d+\.\d s\.\n\nResult:\n1 tables\n\nLog:\nhello from Python$/,
+      );
+      const [script, own] = python.runs;
+      expect(script?.code).toBe(pyScript);
+      expect(script?.args).toEqual({ k: 5 });
+      expect((script as PythonRun | undefined)?.path).toBe("scripts/count.py");
+      // all the files of the skill, which the script can import
+      const files = (script as PythonRun | undefined)?.files ?? {};
+      expect(Object.keys(files).sort()).toEqual([
+        "scripts/count.py",
+        "tools/count.py",
+      ]);
+      expect(new TextDecoder().decode(files["tools/count.py"])).toContain(
+        "def count(items)",
+      );
+      // tm.read_file reads the files of the skill
+      expect(script?.answers[1]).toBe('the skill has no file "data.csv"');
+      // the code of the model has no files, and the same Python: the skill
+      // was added by the user
+      expect((own as PythonRun | undefined)?.files).toBeUndefined();
+      expect([python.starts, python.stops]).toEqual([1, 0]);
+
+      // a skill of the project gets a Python of its own, after the user allows it
+      vi.spyOn(window, "confirm").mockReturnValue(true);
+      await openProjectWith(
+        panel,
+        [
+          folder("project-counter", [
+            file(
+              "SKILL.md",
+              pyCounter.replace("name: counter", "name: project-counter"),
+            ),
+            folder("scripts", [file("count.py", pyScript)]),
+          ]),
+        ],
+        "From the project: project-counter.",
+      );
+      // opening the project stopped the Python of the chat
+      expect(python.stops).toBe(1);
+      services.answers = [
+        { toolCalls: [runPython()] },
+        {
+          toolCalls: [
+            [
+              "run_script",
+              { skill: "project-counter", path: "scripts/count.py" },
+            ],
+          ],
+        },
+        { toolCalls: [runPython()] },
+        { content: "Done." },
+      ];
+      await panel.say("Count with the project.");
+      expect(python.runs).toHaveLength(5);
+      // chat, project, chat again: three Pythons
+      expect([python.starts, python.stops]).toEqual([4, 3]);
     });
 
     it("runs code that the model wrote in the sandbox, after showing it", async () => {
@@ -3772,6 +3947,364 @@ describe("aiChatPlugin", () => {
       expect(panel.texts("Tool").at(-1)).toContain(
         'Error: run_code runs "javascript" or "python", not "ruby".',
       );
+    });
+
+    it("shows the charts that Python drew, only if they are PNG images, and tells the model what they show", async () => {
+      URL.createObjectURL = vi.fn(() => "blob:chart");
+      const revoke = vi.fn();
+      URL.revokeObjectURL = revoke;
+      const write = vi.fn<(items: unknown[]) => Promise<void>>(() =>
+        Promise.resolve(),
+      );
+      vi.stubGlobal("navigator", { ...navigator, clipboard: { write } });
+      vi.stubGlobal(
+        "ClipboardItem",
+        class {
+          constructor(public items: Record<string, Blob>) {}
+        },
+      );
+      const downloads: string[] = [];
+      vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(
+        function (this: HTMLAnchorElement) {
+          downloads.push(this.download);
+        },
+      );
+      const description =
+        "'Cells per cluster'; x axis 'cluster' from -0.5 to 2.5 [0, 1, 2]; y axis 'cells' from 0 to 105; with 3 bar(s)";
+      python.charts = [
+        { png: pngImage(640, 480), description },
+        // something else than a PNG, e.g. an SVG with a script
+        {
+          png: new TextEncoder().encode("<svg onload='alert(1)'></svg>").buffer,
+          description: "not an image",
+        },
+      ];
+      const panel = await openPanel(undefined, undefined, {
+        provider: "anthropic",
+      });
+      await panel.pasteKey(anthropicKey);
+      services.answers = [
+        { toolCalls: [runPython("cells per cluster")] },
+        { content: "The chart shows three clusters." },
+      ];
+      await panel.say("Draw the size of each cluster.");
+      expect(panel.texts("Tool")[0]).toContain(
+        "Result:\n1 tables\n\nCharts, shown to the user in the chat (you do not see them; say what they show only from these words):\n" +
+          `1. 640 × 480 pixels: ${description}\n` +
+          "2. Not shown: it is not a PNG image.\n\nLog:\nhello from Python",
+      );
+      const charts = [
+        ...panel.container.querySelectorAll<HTMLElement>('[data-who="Chart"]'),
+      ];
+      expect(charts).toHaveLength(1);
+      const image = charts[0]!.querySelector("img")!;
+      expect(image.src).toBe("blob:chart");
+      expect(image.alt).toBe(description);
+      const [copy, save] = [...charts[0]!.querySelectorAll("button")];
+      copy!.click();
+      await vi.waitFor(() => expect(copy!.textContent).toBe("Copied"));
+      const [item] = write.mock.calls[0]?.[0] ?? [];
+      expect(
+        (item as { items: Record<string, Blob> }).items["image/png"]?.size,
+      ).toBe(pngImage(640, 480).byteLength);
+      save!.click();
+      expect(downloads).toEqual(["cells-per-cluster-1.png"]);
+      // the images are freed with the chat
+      vi.spyOn(window, "confirm").mockReturnValue(true);
+      panel.button("New chat").click();
+      expect(revoke).toHaveBeenCalledWith("blob:chart");
+      vi.unstubAllGlobals();
+    });
+
+    it("gives the user the files of text that the code offers, and only those", async () => {
+      URL.createObjectURL = vi.fn(() => "blob:file");
+      URL.revokeObjectURL = vi.fn();
+      const downloads: string[] = [];
+      vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(
+        function (this: HTMLAnchorElement) {
+          downloads.push(this.download);
+        },
+      );
+      python.extra = [
+        { kind: "download", name: "zscores.csv", text: ",0,1\n0,230.7,3.3\n" },
+        { kind: "download", name: "../run.exe", text: "MZ" },
+        { kind: "download", name: "table.csv", text: 42 },
+      ];
+      const panel = await openPanel(undefined, undefined, {
+        provider: "anthropic",
+      });
+      await panel.pasteKey(anthropicKey);
+      services.answers = [
+        { toolCalls: [runPython("z-scores")] },
+        { content: "Here is the file." },
+      ];
+      await panel.say("Give me the z-scores as CSV.");
+      const [offered, wrongName, notText] =
+        python.runs[0]?.answers.slice(2) ?? [];
+      expect(offered).toEqual({ name: "zscores.csv", bytes: 17 });
+      expect(wrongName).toBe(
+        'the file must end with .csv, .tsv, .txt, .json, .md, e.g. "zscores.csv"',
+      );
+      expect(notText).toBe(
+        "give the text of the file, e.g. the CSV as a string",
+      );
+      const files = [
+        ...panel.container.querySelectorAll<HTMLElement>('[data-who="File"]'),
+      ];
+      expect(files).toHaveLength(1);
+      expect(files[0]?.textContent).toContain(
+        "📄 zscores.csv (17 B), from the code: click Save to keep it",
+      );
+      // nothing is saved until the user clicks
+      expect(downloads).toEqual([]);
+      [...files[0]!.querySelectorAll("button")]
+        .find((button) => button.textContent === "Save")!
+        .click();
+      expect(downloads).toEqual(["zscores.csv"]);
+    });
+
+    /** The files of a repository like anhood, without SKILL.md */
+    const toolsRepository = {
+      LICENSE: "MIT License",
+      "README.md": "# Tools\nSee example.ipynb.",
+      "tools/__init__.py": "from .nhood import nhood\n",
+      "tools/nhood.py":
+        "import numpy as np\nimport scipy.sparse as sp\n\ndef nhood(xy, labels):\n    return 1\n",
+      "tools/wrapper.py": "import squidpy\nfrom .nhood import nhood\n",
+      "example.ipynb": JSON.stringify({
+        cells: [
+          { cell_type: "markdown", source: "# Example" },
+          {
+            cell_type: "code",
+            source: "import seaborn\nfrom tools import nhood",
+            outputs: [{ data: { "image/png": "BIGIMAGE" } }],
+          },
+        ],
+      }),
+      "logo.png": "PNG",
+    };
+
+    /**
+     * Sends a request, and answers the question of the chat (e.g. whether to
+     * add a skill) once it is shown
+     */
+    async function sayAndAnswer(
+      panel: Awaited<ReturnType<typeof openPanel>>,
+      text: string,
+      button: string,
+    ): Promise<HTMLElement> {
+      (panel.container.querySelector("textarea") as HTMLTextAreaElement).value =
+        text;
+      panel.button("Send").click();
+      let question: HTMLElement | undefined;
+      await vi.waitFor(() => {
+        question = [
+          ...panel.container.querySelectorAll<HTMLElement>(
+            '[data-who="Confirm"]',
+          ),
+        ].find((element) =>
+          [...element.querySelectorAll("button")].some(
+            (candidate) => !candidate.disabled,
+          ),
+        );
+        expect(question).toBeDefined();
+      });
+      [...question!.querySelectorAll("button")]
+        .find((candidate) => candidate.textContent === button)!
+        .click();
+      await vi.waitFor(() =>
+        expect(panel.button("Send").textContent).toBe("Send"),
+      );
+      return question!;
+    }
+
+    it("adds a skill from GitHub only after the user has seen what it holds, and runs its Python code", async () => {
+      gitHub.files = toolsRepository;
+      gitHub.license = { spdx_id: "MIT", name: "MIT License" };
+      const confirm = vi.spyOn(window, "confirm");
+      const panel = await openPanel(undefined, undefined, {
+        provider: "anthropic",
+      });
+      await panel.pasteKey(anthropicKey);
+      services.answers = [
+        {
+          toolCalls: [
+            ["add_skill_from_github", { url: "https://github.com/lab/tools" }],
+          ],
+        },
+        { content: "Added." },
+      ];
+      const question = await sayAndAnswer(
+        panel,
+        "Use https://github.com/lab/tools",
+        "Add skill",
+      );
+      const shown = question.textContent ?? "";
+      for (const part of [
+        "Add a skill from GitHub?",
+        "Repository: lab/tools",
+        `Commit: ${gitHubCommit} (the files exactly as they are in this commit)`,
+        "License: MIT",
+        "(with SKILL.md, written by the chat); 1 left out",
+        "logo.png: not text or code",
+        "Skills: tools. The repository has no SKILL.md: the chat wrote a minimal one",
+        "numpy: in Pyodide ✓ (tools/nhood.py)",
+        "seaborn: not in Pyodide ✗ (example.ipynb)",
+        "squidpy: not in Pyodide ✗ (tools/wrapper.py)",
+        "Will not work: Python in the chat has only the packages of Pyodide, and cannot install others, so these files cannot run: " +
+          "example.ipynb (needs seaborn); tools/wrapper.py (needs squidpy). The rest can.",
+        "⚠ This is code written by other people.",
+        "Added.",
+      ]) {
+        expect(shown).toContain(part);
+      }
+      expect(panel.texts("Tool")[0]).toBe(
+        "add_skill_from_github(url: https://github.com/lab/tools)\n→ " +
+          'Done: the user added the skill "tools" from github.com/lab/tools (commit a7e9fa5, license MIT), with 7 files. It is on: load it with load_skill. ' +
+          "The repository has no SKILL.md: the chat wrote a minimal one. Read its README and its code with read_skill_file before you use it. " +
+          "Python packages that Pyodide does not have: seaborn, squidpy. So these files cannot run: example.ipynb, tools/wrapper.py.",
+      );
+      expect(panel.container.textContent).toContain("toolsGitHub");
+      expect(confirm).not.toHaveBeenCalled();
+
+      // its notebook as text, without the outputs; its code with run_code,
+      // in a Python of its own
+      const ownCode =
+        "from tools import nhood\n\nasync def main(tm):\n    return nhood(None, None)";
+      services.answers = [
+        {
+          toolCalls: [
+            ["read_skill_file", { skill: "tools", path: "example.ipynb" }],
+            [
+              "run_code",
+              {
+                title: "neighborhoods",
+                language: "python",
+                skill: "tools",
+                code: ownCode,
+              },
+            ],
+            [
+              "run_code",
+              { title: "no skill", language: "python", code: pythonCode },
+            ],
+            [
+              "run_code",
+              {
+                title: "x",
+                language: "python",
+                skill: "nope",
+                code: pythonCode,
+              },
+            ],
+          ],
+        },
+        { content: "Done." },
+      ];
+      await panel.say("Compute the neighborhoods with it.");
+      const [notebook, withSkill, , noSkill] = panel.texts("Tool").slice(1);
+      expect(notebook).toContain(
+        '→ Done: "example.ipynb" of the skill "tools":\n\n# %% [markdown]\n# Example\n\n# %% [code]\nimport seaborn\nfrom tools import nhood',
+      );
+      expect(notebook).not.toContain("BIGIMAGE");
+      expect(withSkill).toContain('→ Done: ran the code "neighborhoods"');
+      expect(noSkill).toContain('Error: no skill named "nope" is on.');
+      expect(scriptRows(panel.container).map(({ line }) => line)).toEqual([
+        "📜 Dia's code: neighborhoods (Python, with tools)",
+        "📜 Dia's code: no skill (Python)",
+      ]);
+      const [run, plain] = python.runs;
+      expect(Object.keys((run as PythonRun).files ?? {}).sort()).toEqual([
+        "LICENSE",
+        "README.md",
+        "example.ipynb",
+        "tools/__init__.py",
+        "tools/nhood.py",
+        "tools/wrapper.py",
+      ]);
+      expect((plain as PythonRun).files).toBeUndefined();
+      // code from GitHub, then the code of the chat: two Pythons
+      expect([python.starts, python.stops]).toEqual([2, 1]);
+
+      // better instructions, which the user accepts
+      const better =
+        "---\nname: tools\ndescription: Neighborhood enrichment of clusters.\nlicense: MIT\n---\n\nCall nhood(xy, labels) in run_code.";
+      services.answers = [
+        {
+          toolCalls: [
+            [
+              "propose_skill_instructions",
+              { skill: "tools", skill_md: better },
+            ],
+          ],
+        },
+        { toolCalls: [["load_skill", { name: "tools" }]] },
+        { content: "Done." },
+      ];
+      const proposal = await sayAndAnswer(
+        panel,
+        "Write better instructions.",
+        "Use these instructions",
+      );
+      expect(proposal.textContent).toContain(
+        "New instructions for the skill tools?",
+      );
+      expect(proposal.querySelector("pre")?.textContent).toBe(better);
+      expect(panel.texts("Tool").at(-2)).toContain(
+        'Done: the skill "tools" has the new instructions',
+      );
+      expect(panel.texts("Tool").at(-1)).toContain(
+        "Call nhood(xy, labels) in run_code.",
+      );
+      expect(panel.container.textContent).toContain(
+        "Neighborhood enrichment of clusters.",
+      );
+    });
+
+    it("adds nothing when the user cancels, warns of a repository without a license, and opens the same question from the settings", async () => {
+      gitHub.files = { "nhood.py": "import numpy" };
+      gitHub.license = null;
+      const panel = await openPanel(undefined, undefined, {
+        provider: "anthropic",
+      });
+      await panel.pasteKey(anthropicKey);
+      services.answers = [
+        { toolCalls: [["add_skill_from_github", { url: "lab/tools" }]] },
+        { content: "Not added." },
+      ];
+      const question = await sayAndAnswer(panel, "Add lab/tools.", "Cancel");
+      expect(question.textContent).toContain(
+        "License: ⚠ none. This repository gives no license, so the rights to use, change and share its code are not given to you",
+      );
+      expect(question.textContent).toContain("Not added.");
+      expect(panel.texts("Tool")[0]).toContain(
+        "Nothing changed: the user did not add the skill from github.com/lab/tools.",
+      );
+      expect(panel.summary.textContent).not.toContain("skill");
+
+      // the settings ask for the address, then show the same question
+      const prompt = vi
+        .spyOn(window, "prompt")
+        .mockReturnValue("https://github.com/lab/tools");
+      panel.button("Add skill from GitHub…").click();
+      expect(prompt).toHaveBeenCalledOnce();
+      let fromSettings: HTMLElement | undefined;
+      await vi.waitFor(() => {
+        fromSettings = [
+          ...panel.container.querySelectorAll<HTMLElement>(
+            '[data-who="Confirm"]',
+          ),
+        ].at(-1);
+        expect(fromSettings?.textContent).toContain("Add a skill from GitHub?");
+        expect(fromSettings).not.toBe(question);
+      });
+      [...fromSettings!.querySelectorAll("button")]
+        .find((button) => button.textContent === "Add skill")!
+        .click();
+      await vi.waitFor(() =>
+        expect(panel.summary.textContent).toContain("· 1 skill"),
+      );
+      expect(panel.container.textContent).toContain("Added: tools.");
     });
 
     it("tells how many files of Python the browser keeps, and forgets them", async () => {

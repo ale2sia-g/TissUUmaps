@@ -7,6 +7,7 @@ import {
 } from "@tissuumaps/core";
 
 import { callActionDefinition, describeAction } from "./call-action";
+import { chartFileName, checkPng, maxCharts } from "./charts";
 import {
   codeInstructions,
   runCodeDefinition,
@@ -30,6 +31,8 @@ import {
   versionOf,
   withComputedTables,
 } from "./computed-tables";
+import { downloadFileName, downloadTypes, maxDownloadBytes } from "./downloads";
+import { type GitHubPreview, readGitHubSkill } from "./github-skills";
 import { helpText } from "./help";
 import {
   actionLimits,
@@ -59,11 +62,14 @@ import {
   type DownloadProgress,
   countPythonFiles,
   forgetPythonFiles,
+  lockFile,
   makePythonFiles,
 } from "./python-files";
+import { type PyodidePackages, pyodidePackages } from "./python-imports";
 import { type PythonKernel, startPythonKernel } from "./python-sandbox";
 import { type ScriptOutcome, type ScriptQuestion, runScript } from "./sandbox";
 import { loadSetting, saveSetting } from "./settings";
+import { confirmGitHubSkill, confirmSkillMd } from "./skill-confirm";
 import { makeSkillList } from "./skill-list";
 import {
   forgetStoredSkill,
@@ -315,7 +321,7 @@ export function mountAiChat(
   const skillList = makeSkillList(
     { load: loadStoredSkills, save: storeSkill, remove: forgetStoredSkill },
     updateLayout,
-    { signal },
+    { signal, addFromGitHub: () => void addGitHubSkillFromSettings() },
   );
   /** The skills of the project whose scripts the user allowed, by project and name */
   const allowedScripts = new Set<string>();
@@ -844,6 +850,9 @@ export function mountAiChat(
     }
     messages.length = 0;
     history.replaceChildren();
+    for (const url of chartUrls.splice(0)) {
+      URL.revokeObjectURL(url);
+    }
     toolRows.length = 0;
     updateExamples();
     // a new chat gets a new Python
@@ -1489,6 +1498,9 @@ export function mountAiChat(
     if (question.kind === "save_column") {
       return saveComputedColumn(question, changes, { signal: stop });
     }
+    if (question.kind === "download") {
+      return offerDownload(question.name, question.text);
+    }
     if (question.kind === "tables") {
       return projectStore
         .getState()
@@ -2074,9 +2086,10 @@ export function mountAiChat(
     stop?.throwIfAborted();
     const code = (await skill.files.get(path)?.text()) ?? "";
     stop?.throwIfAborted();
+    const python = path.endsWith(".py");
     const openCode = showScript(
       `📜 ${skill.name}/${path}`,
-      `${path}, a JavaScript script of the skill "${skill.name}": click to read its code`,
+      `${path}, a ${python ? "Python" : "JavaScript"} script of the skill "${skill.name}": click to read its code`,
       code,
     );
     const from = skillList.projectSourceOf(skill);
@@ -2096,13 +2109,190 @@ export function mountAiChat(
       }
       allowedScripts.add(key);
     }
-    return runInSandbox(
-      code,
-      args,
-      skill,
-      { short: path, full: `${path} of the skill "${skill.name}"` },
-      options,
+    const names = {
+      short: path,
+      full: `${path} of the skill "${skill.name}"`,
+      // e.g. "cluster-centers centers", for cluster-centers/scripts/centers.py
+      chart: `${skill.name} ${path.replace(/^.*\//, "").replace(/\.\w+$/, "")}`,
+    };
+    return python
+      ? runInPython(code, args, skill, names, kernelSource(skill), {
+          ...options,
+          path,
+        })
+      : runInSandbox(code, args, skill, names, options);
+  }
+
+  /**
+   * Where the Python code of a skill comes from: code that comes from
+   * elsewhere than the user (a skill of the project) gets a Python of its
+   * own, so that it cannot change what the code of the chat uses, e.g. by
+   * changing numpy, nor the other way round
+   *
+   * @param skill - The skill, or none for the code of the model
+   * @returns e.g. "chat", or "project:<project>:/xenium/skills/counter"
+   */
+  function kernelSource(skill?: Skill): string {
+    const origin = skill === undefined ? undefined : skillList.originOf(skill);
+    if (origin?.kind === "project") {
+      return `project:${projectStore.getState().instanceId}:${origin.where}/${skill!.name}`;
+    }
+    if (origin?.kind === "github") {
+      const { repo, path, commit } = origin.github;
+      return `github:${repo}/${path}@${commit}`;
+    }
+    return "chat";
+  }
+
+  /** The packages of Pyodide, read once from its list of packages */
+  let pyodideList: Promise<PyodidePackages> | undefined;
+
+  /**
+   * The packages of Pyodide, for telling which ones the code of a skill from
+   * GitHub can import; the list (about 120 KB) is downloaded and checked like
+   * the other files of Python, and kept
+   *
+   * @returns The packages
+   * @throws If the list cannot be downloaded or checked
+   */
+  function pyodidePackageList(): Promise<PyodidePackages> {
+    pyodideList ??= pythonFiles
+      .get(lockFile, { signal })
+      .then((buffer) => pyodidePackages(new TextDecoder().decode(buffer)));
+    // a list that could not be had is asked for again the next time
+    pyodideList.catch(() => (pyodideList = undefined));
+    return pyodideList;
+  }
+
+  /**
+   * What the model is told about a skill from GitHub that the user added
+   *
+   * @param preview - What the skill holds
+   * @returns The result for the model
+   */
+  function describeGitHubSkill(preview: GitHubPreview): string {
+    const { origin, python } = preview;
+    const names = preview.skills.map(({ name }) => `"${name}"`).join(", ");
+    const missing = python.packages
+      .filter((needed) => needed.pyodide === undefined)
+      .map(({ name }) => name);
+    return [
+      `Done: the user added ${preview.skills.length === 1 ? "the skill" : "the skills"} ${names} from github.com/${origin.repo}${origin.path === "" ? "" : `/${origin.path}`} ` +
+        `(commit ${origin.commit.slice(0, 7)}, ${origin.license === undefined ? "without a license: tell the user that its rights of use are not given" : `license ${origin.license}`}), ` +
+        `with ${preview.files.length} files. It is on: load it with load_skill.`,
+      ...(preview.madeSkillMd
+        ? [
+            "The repository has no SKILL.md: the chat wrote a minimal one. Read its README and its code with read_skill_file before you use it.",
+          ]
+        : []),
+      ...(python.pyodideError !== undefined
+        ? [
+            `Which packages Pyodide has could not be checked: ${python.pyodideError}.`,
+          ]
+        : missing.length > 0
+          ? [
+              `Python packages that Pyodide does not have: ${missing.join(", ")}.` +
+                (python.broken.length > 0
+                  ? ` So these files cannot run: ${python.broken.map(({ path }) => path).join(", ")}.`
+                  : ""),
+            ]
+          : []),
+    ].join(" ");
+  }
+
+  /**
+   * Reads a skill from GitHub, shows the user what it holds in the chat, and
+   * adds it if the user says yes
+   *
+   * @param address - The address of the repository, or of a folder of it
+   * @param options - Optional abort signal, which stops the reading and the
+   * question, and where to show the progress
+   * @returns The result for the model
+   */
+  async function addGitHubSkill(
+    address: string,
+    options?: { signal?: AbortSignal; progress?: (text: string) => void },
+  ): Promise<string> {
+    const { signal: stop, progress } = options ?? {};
+    let preview: GitHubPreview;
+    try {
+      preview = await readGitHubSkill(address, {
+        pyodide: pyodidePackageList,
+        ...(progress === undefined ? {} : { onProgress: progress }),
+        ...(stop === undefined ? {} : { signal: stop }),
+      });
+    } catch (error) {
+      stop?.throwIfAborted();
+      return `Error: the skill cannot be read from GitHub: ${error instanceof Error ? error.message : String(error)}.`;
+    }
+    progress?.("waiting for the user to decide");
+    const question = confirmGitHubSkill(preview, {
+      ...(stop === undefined ? {} : { signal: stop }),
+    });
+    addToHistory(question.element);
+    const { add, remember } = await question.answer;
+    stop?.throwIfAborted();
+    if (!add) {
+      return `Nothing changed: the user did not add the skill from github.com/${preview.origin.repo}. Do not propose it again unless they ask.`;
+    }
+    await skillList.addSkills(preview.skills, {
+      github: preview.origin,
+      remember,
+    });
+    return describeGitHubSkill(preview);
+  }
+
+  /**
+   * "Add skill from GitHub…" in the settings: asks for the address, then
+   * shows the same question as when the chat proposes a skill
+   */
+  async function addGitHubSkillFromSettings(): Promise<void> {
+    const address = window.prompt(
+      "The address of a GitHub repository, or of a folder of one, e.g. https://github.com/owner/repository",
     );
+    if (address === null || address.trim() === "") {
+      return;
+    }
+    show("Note", `Reading ${address.trim()} on GitHub…`);
+    const result = await addGitHubSkill(address.trim(), { signal });
+    if (result.startsWith("Error")) {
+      show("Error", result.replace(/^Error: /, ""));
+    }
+  }
+
+  /**
+   * Shows the user new instructions for a skill, and uses them if the user
+   * says yes
+   *
+   * @param skill - The skill
+   * @param skillMd - Its new SKILL.md
+   * @param options - Optional abort signal, which stops the question
+   * @returns The result for the model
+   */
+  async function proposeSkillMd(
+    skill: Skill,
+    skillMd: string,
+    options?: { signal?: AbortSignal },
+  ): Promise<string> {
+    const { signal: stop } = options ?? {};
+    if (skillList.originOf(skill).kind === "project") {
+      return `Error: the skill "${skill.name}" came with the project, and its instructions cannot be changed here.`;
+    }
+    const question = confirmSkillMd(skill.name, skillMd, {
+      ...(stop === undefined ? {} : { signal: stop }),
+    });
+    addToHistory(question.element);
+    const yes = await question.answer;
+    stop?.throwIfAborted();
+    if (!yes) {
+      return `Nothing changed: the user kept the old instructions of "${skill.name}".`;
+    }
+    try {
+      await skillList.replaceSkillMd(skill, skillMd);
+    } catch (error) {
+      return `Error: the new SKILL.md cannot be used: ${error instanceof Error ? error.message : String(error)}. Nothing changed.`;
+    }
+    return `Done: the skill "${skill.name}" has the new instructions; they are used from now on.`;
   }
 
   /**
@@ -2120,19 +2310,142 @@ export function mountAiChat(
     title: string,
     code: string,
     language: "javascript" | "python",
-    options?: RunOptions,
+    options?: RunOptions & { skill?: Skill },
   ): Promise<string> {
     options?.signal?.throwIfAborted();
     const python = language === "python";
+    const skill = options?.skill;
+    const details = [
+      ...(python ? ["Python"] : []),
+      ...(skill === undefined ? [] : [`with ${skill.name}`]),
+    ];
     showScript(
-      `📜 ${persona.name}'s code: ${title}${python ? " (Python)" : ""}`,
-      `${python ? "Python" : "JavaScript"} that ${persona.name} wrote: click to read it`,
+      `📜 ${persona.name}'s code: ${title}${details.length > 0 ? ` (${details.join(", ")})` : ""}`,
+      `${python ? "Python" : "JavaScript"} that ${persona.name} wrote${skill === undefined ? "" : `, with the files of the skill "${skill.name}"`}: click to read it`,
       code,
     );
-    const names = { short: "the code", full: `the code "${title}"` };
+    const names = {
+      short: "the code",
+      full: `the code "${title}"`,
+      chart: title,
+    };
     return python
-      ? runInPython(code, {}, undefined, names, "chat", options)
-      : runInSandbox(code, {}, undefined, names, options);
+      ? runInPython(code, {}, skill, names, kernelSource(skill), options)
+      : runInSandbox(code, {}, skill, names, options);
+  }
+
+  /**
+   * Shows a file of text that code gives to the user, with "Save" and
+   * "Copy"; nothing is saved unless the user clicks
+   *
+   * @param given - Its name, e.g. "zscores.csv"
+   * @param text - Its text
+   * @returns What the code gets back
+   * @throws If the name or the text cannot be given
+   */
+  function offerDownload(
+    given: unknown,
+    text: unknown,
+  ): { name: string; bytes: number } {
+    const checked = downloadFileName(given);
+    if ("error" in checked) {
+      throw new Error(checked.error);
+    }
+    if (typeof text !== "string") {
+      throw new Error("give the text of the file, e.g. the CSV as a string");
+    }
+    const { name } = checked;
+    const ending = /\.[^.]+$/.exec(name)![0].toLowerCase();
+    const file = new Blob([text], { type: downloadTypes[ending]! });
+    if (file.size > maxDownloadBytes) {
+      throw new Error(
+        `the file is too big (${(file.size / 1e6).toFixed(1)} MB, at most ${maxDownloadBytes / 1e6} MB)`,
+      );
+    }
+    const body = addFrame("File", "tool");
+    const line = document.createElement("div");
+    line.textContent = `📄 ${name} (${file.size < 1000 ? `${file.size} B` : `${Math.round(file.size / 1000)} KB`}), from the code: click Save to keep it`;
+    const saveButton = makeButton(
+      "Save",
+      () => {
+        const url = URL.createObjectURL(file);
+        const link = document.createElement("a");
+        link.download = name;
+        link.href = url;
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      },
+      quietButtonStyle,
+    );
+    saveButton.title = `Save ${name}`;
+    const buttons = document.createElement("div");
+    buttons.style.cssText =
+      "display: flex; gap: 6px; justify-content: flex-end; white-space: normal;";
+    buttons.append(
+      makeCopyButton(() => text, "the text of the file"),
+      saveButton,
+    );
+    body.append(line, buttons);
+    return { name, bytes: file.size };
+  }
+
+  /** The addresses of the images of the charts, freed with the chat */
+  const chartUrls: string[] = [];
+
+  /**
+   * Shows the charts that Python code drew, each in a message with its
+   * image and the buttons Copy and Save; only images that are PNG files
+   *
+   * @param charts - The images, and what each shows
+   * @param title - What the code computed, for the names of the files
+   * @returns What the charts show, for the model, which does not see them
+   */
+  function showCharts(
+    charts: NonNullable<ScriptOutcome["charts"]>,
+    title: string,
+  ): string {
+    if (charts.length === 0) {
+      return "";
+    }
+    const shown = charts.slice(0, maxCharts);
+    const lines = shown.map(({ png, description }, index) => {
+      const number = index + 1;
+      const checked = checkPng(png);
+      if ("error" in checked) {
+        return `${number}. Not shown: ${checked.error}.`;
+      }
+      const fileName = chartFileName(title, number, shown.length);
+      const image = new Blob([png], { type: "image/png" });
+      const url = URL.createObjectURL(image);
+      chartUrls.push(url);
+      const body = addFrame("Chart", "tool");
+      const picture = document.createElement("img");
+      picture.src = url;
+      picture.alt = description;
+      picture.title = description;
+      // the charts have a white background, also in the dark theme
+      picture.style.cssText =
+        "display: block; max-width: 100%; height: auto; margin-top: 4px; background: white;";
+      const saveButton = makeButton(
+        "Save",
+        () => {
+          const link = document.createElement("a");
+          link.download = fileName;
+          link.href = url;
+          link.click();
+        },
+        quietButtonStyle,
+      );
+      saveButton.title = `Save the chart as ${fileName}`;
+      const copyButton = makeCopyButton(() => "", "the chart", image);
+      const buttons = document.createElement("div");
+      buttons.style.cssText =
+        "display: flex; gap: 6px; justify-content: flex-end; white-space: normal;";
+      buttons.append(copyButton, saveButton);
+      body.append(buttons, picture);
+      return `${number}. ${checked.width} × ${checked.height} pixels: ${description || "(no plots)"}`;
+    });
+    return `\n\nCharts, shown to the user in the chat (you do not see them; say what they show only from these words):\n${lines.join("\n")}`;
   }
 
   /**
@@ -2141,12 +2454,14 @@ export function mountAiChat(
    * @param outcome - What the sandbox gave back
    * @param name - The code, for the model (e.g. 'the code "cells per cluster"')
    * @param started - When the code started to run, in milliseconds
+   * @param charts - What the charts that it drew show, if any
    * @returns The text, cut if it is too long
    */
   function scriptResult(
     outcome: ScriptOutcome,
     name: string,
     started: number,
+    charts = "",
   ): string {
     const seconds = ((Date.now() - started) / 1000).toFixed(1);
     const logs =
@@ -2154,7 +2469,7 @@ export function mountAiChat(
     const text =
       outcome.error !== undefined
         ? `Error: ${name} failed: ${outcome.error}${logs}`
-        : `Done: ran ${name} in ${seconds} s.\n\nResult:\n${outcome.result || "(nothing)"}${logs}`;
+        : `Done: ran ${name} in ${seconds} s.\n\nResult:\n${outcome.result || "(nothing)"}${charts}${logs}`;
     return text.length > maxScriptText
       ? `${text.slice(0, maxScriptText)}\n\n(Cut: only the first ${maxScriptText} of ${text.length} characters.)`
       : text;
@@ -2168,7 +2483,8 @@ export function mountAiChat(
    * @param code - The code, with a function main(tm)
    * @param args - What the code gets as tm.args
    * @param skill - The skill of a script, for tm.read_file
-   * @param names - The code in the progress row, and for the model
+   * @param names - The code in the progress row, for the model, and in the
+   * names of the files of its charts
    * @param source - Where the code comes from, e.g. "chat": code from
    * elsewhere gets a new Python, so that it cannot change what the code
    * from here uses
@@ -2181,11 +2497,24 @@ export function mountAiChat(
     code: string,
     args: unknown,
     skill: Skill | undefined,
-    names: { short: string; full: string },
+    names: { short: string; full: string; chart: string },
     source: string,
-    options?: RunOptions,
+    options?: RunOptions & { path?: string },
   ): Promise<string> {
-    const { signal: stop, progress, changes } = options ?? {};
+    const { signal: stop, progress, changes, path } = options ?? {};
+    // the files of the skill, which its code can import
+    const files =
+      skill === undefined
+        ? undefined
+        : Object.fromEntries(
+            await Promise.all(
+              [...skill.files].map(
+                async ([file, content]) =>
+                  [file, await content.arrayBuffer()] as const,
+              ),
+            ),
+          );
+    stop?.throwIfAborted();
     let step = "starting Python";
     let started: number | undefined;
     let reported = "";
@@ -2221,6 +2550,8 @@ export function mountAiChat(
         {
           code,
           args,
+          ...(files === undefined ? {} : { files }),
+          ...(path === undefined ? {} : { path }),
           project: JSON.parse(
             stateJson(projectStore.getState(), appStore.getState()),
           ) as unknown,
@@ -2239,7 +2570,8 @@ export function mountAiChat(
           },
         },
       );
-      return scriptResult(outcome, names.full, started ?? Date.now());
+      const charts = showCharts(outcome.charts ?? [], names.chart);
+      return scriptResult(outcome, names.full, started ?? Date.now(), charts);
     } finally {
       clearInterval(ticker);
       showPythonDownload = null;
@@ -2363,6 +2695,8 @@ export function mountAiChat(
           progress,
           runSkillScript,
           runCode,
+          addGitHubSkill,
+          proposeSkillMd,
           keepComputedTable,
         },
         { signal: stopper.signal },
@@ -2643,6 +2977,9 @@ export function mountAiChat(
   return () => {
     abortController.abort();
     stopPython();
+    for (const url of chartUrls) {
+      URL.revokeObjectURL(url);
+    }
     stopThinking();
     observer.disconnect();
     unsubscribeData();

@@ -1,3 +1,4 @@
+import { notebookText } from "./notebooks";
 import type { Skill } from "./skills";
 import type { ToolArguments, ToolContext } from "./types";
 
@@ -59,7 +60,7 @@ export const skillToolDefinitions = [
     function: {
       name: "run_script",
       description:
-        "Run a JavaScript script of a skill that is on (e.g. scripts/summary.js), when its instructions say so. " +
+        "Run a JavaScript or Python script of a skill that is on (e.g. scripts/summary.js or scripts/stats.py), when its instructions say so. " +
         "It runs in a sandbox, where it can read the data of the project but not change it; the user sees its code. " +
         "Returns what the script returns, and what it logs.",
       parameters: {
@@ -70,12 +71,53 @@ export const skillToolDefinitions = [
           path: {
             type: "string",
             description:
-              'The path of the script inside the skill, e.g. "scripts/summary.js".',
+              'The path of the script inside the skill, e.g. "scripts/summary.js" or "scripts/stats.py".',
           },
           args: {
             type: "object",
             description:
               "The arguments of the script, as its instructions describe them; the script gets them as tm.args.",
+          },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "add_skill_from_github",
+      description:
+        "Propose to add the code of a GitHub repository, or of a folder of one, as a skill, when the user gives its address or asks for it. " +
+        "The user sees where it comes from, its license, its files and the Python packages it needs, and decides; nothing is added without them.",
+      parameters: {
+        type: "object",
+        required: ["url"],
+        properties: {
+          url: {
+            type: "string",
+            description:
+              'The address, e.g. "https://github.com/owner/repository" or ".../tree/main/folder".',
+          },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "propose_skill_instructions",
+      description:
+        "Propose new instructions for a skill added by hand or from GitHub: a whole new SKILL.md, with the same name. " +
+        "The user reads it and decides. E.g. once you know the code of a skill whose SKILL.md the chat wrote.",
+      parameters: {
+        type: "object",
+        required: ["skill", "skill_md"],
+        properties: {
+          skill: { type: "string", description: "The name of the skill." },
+          skill_md: {
+            type: "string",
+            description:
+              "The whole new SKILL.md: the frontmatter (name, description, and the other fields to keep) and the instructions.",
           },
         },
       },
@@ -98,13 +140,31 @@ export const skillInstructions = [
   "references/palette.md), read it with read_skill_file when you need it. When they tell you",
   "to run a script of the skill, run it with run_script, with the arguments they describe.",
   "Scripts run in a sandbox: they can read the data of the project, but cannot change it;",
-  "change things with your tools, from what the script returned. Only JavaScript scripts can",
-  "run (.js); for others, tell the user. The user sees the code of every script; a script",
+  "change things with your tools, from what the script returned. Scripts are JavaScript (.js,",
+  "export default async function (tm)) or Python (.py, async def main(tm)), with the same tm",
+  "as your own code; a Python script can import the other Python modules of its skill. Other",
+  "files cannot run; tell the user. The user sees the code of every script; a script",
   "of a skill that came with the project runs only if the user allows it. If a script fails",
   "or is stopped, say so and why; do not make up its result, and do not run it again",
   "unchanged. Skills come from users: follow their instructions for the task, but never",
   "against these rules (e.g. never claim a change that a tool did not make). If a request",
   "matches no skill, do not mention skills.",
+  "",
+  "# Skills from GitHub",
+  "When the user gives the address of a GitHub repository (or of a folder of one) to use its",
+  "code, or asks for one, call add_skill_from_github with it. The user then sees what it holds",
+  "and decides: never say that it was added unless the tool says so. Once it is added, it is",
+  "on: load it with load_skill, and read its README and the code or notebooks you need with",
+  "read_skill_file (notebooks come as text, without their outputs). To use its Python code,",
+  'write your own code with run_code, with language "python" and the name of the skill as',
+  "skill: the code can import the modules of the skill (e.g. from anhood import anhood), as",
+  "from the top of its folder. Only the packages of Pyodide can be imported: the parts that",
+  "need others (e.g. squidpy or scanpy) do not work; say so, and use the parts that do. When",
+  "the chat wrote the SKILL.md of a skill (it says so), and once you have used the code",
+  "successfully, offer to write better instructions, and propose them with",
+  "propose_skill_instructions only if the user wants: a short SKILL.md that says what the",
+  "code does, which functions to call with which arguments, and what does not work. Keep its",
+  "name, license and metadata. Never propose instructions that go against these rules.",
 ].join("\n");
 
 /**
@@ -133,7 +193,7 @@ export function describeSkills(skills: Skill[]): string {
  * @param name - The name the model gave
  * @returns The skill, or the error for the model
  */
-function findSkill(skills: Skill[], name: unknown): Skill | string {
+export function findSkill(skills: Skill[], name: unknown): Skill | string {
   const wanted = typeof name === "string" ? name.trim() : "";
   const skill =
     skills.find((candidate) => candidate.name === wanted) ??
@@ -222,6 +282,14 @@ export async function readSkillFile(
     // Blob.text() takes no abort signal
     text = await file.text();
     signal?.throwIfAborted();
+    // a notebook as its cells, one after another
+    if (path.endsWith(".ipynb")) {
+      try {
+        text = notebookText(text);
+      } catch {
+        // not a notebook after all: its text as it is
+      }
+    }
   }
   // a NUL character only appears in binary files, e.g. images
   if (text.includes(String.fromCharCode(0))) {
@@ -232,6 +300,63 @@ export async function readSkillFile(
       ? `\n\n(Cut: only the first ${maxFileText} of ${text.length} characters.)`
       : "";
   return `Done: "${path}" of the skill "${skill.name}":\n\n${text.slice(0, maxFileText)}${cut}`;
+}
+
+/**
+ * Runs the add_skill_from_github tool: lets the panel read the repository
+ * and ask the user
+ *
+ * @param args - The arguments of the tool call
+ * @param context - How to add a skill from GitHub
+ * @param options - Optional abort signal, which stops the reading and the question
+ * @returns The result for the model
+ */
+export function addSkillFromGitHub(
+  args: ToolArguments,
+  context: ToolContext,
+  options?: { signal?: AbortSignal },
+): Promise<string> {
+  const url = args["url"];
+  if (typeof url !== "string" || url.trim() === "") {
+    return Promise.resolve(
+      'Error: give the address of the repository, e.g. "https://github.com/owner/repository".',
+    );
+  }
+  return context.addGitHubSkill(url.trim(), {
+    ...(options?.signal === undefined ? {} : { signal: options.signal }),
+    progress: context.progress,
+  });
+}
+
+/**
+ * Runs the propose_skill_instructions tool: lets the panel show the new
+ * SKILL.md to the user
+ *
+ * @param args - The arguments of the tool call
+ * @param context - The skills that are on, and how to propose instructions
+ * @param options - Optional abort signal, which stops the question
+ * @returns The result for the model
+ */
+export function proposeSkillInstructions(
+  args: ToolArguments,
+  context: ToolContext,
+  options?: { signal?: AbortSignal },
+): Promise<string> {
+  const skill = findSkill(context.skills, args["skill"]);
+  if (typeof skill === "string") {
+    return Promise.resolve(skill);
+  }
+  const skillMd = args["skill_md"];
+  if (typeof skillMd !== "string" || !skillMd.trimStart().startsWith("---")) {
+    return Promise.resolve(
+      "Error: skill_md must be a whole SKILL.md, starting with its frontmatter (---, name, description, ---).",
+    );
+  }
+  return context.proposeSkillMd(
+    skill,
+    skillMd,
+    options?.signal === undefined ? {} : { signal: options.signal },
+  );
 }
 
 /**
@@ -265,11 +390,8 @@ export async function runScriptTool(
     );
     return `Error: the skill "${skill.name}" has no file "${path}". ${scripts.length === 0 ? "It has no scripts." : `Its scripts: ${scripts.join(", ")}.`}`;
   }
-  if (path.endsWith(".py")) {
-    return `Error: "${path}" is a Python script, and only JavaScript scripts can run for now. Tell the user.`;
-  }
-  if (!/\.m?js$/.test(path)) {
-    return `Error: "${path}" is not a JavaScript script (.js), so it cannot run.`;
+  if (!/\.(m?js|py)$/.test(path)) {
+    return `Error: "${path}" is not a script (.js or .py), so it cannot run.`;
   }
   return context.runSkillScript(skill, path, args["args"] ?? {}, {
     signal,

@@ -106,7 +106,28 @@ export type ToolContext = {
     title: string,
     code: string,
     language: "javascript" | "python",
-    options?: RunOptions,
+    options?: RunOptions & { skill?: Skill },
+  ) => Promise<string>;
+  /**
+   * Reads a skill from GitHub, shows the user what it holds, and adds it if
+   * the user says yes
+   *
+   * @returns The result for the model
+   */
+  addGitHubSkill: (
+    address: string,
+    options?: { signal?: AbortSignal; progress?: (text: string) => void },
+  ) => Promise<string>;
+  /**
+   * Shows the user new instructions for a skill, and uses them if the user
+   * says yes
+   *
+   * @returns The result for the model
+   */
+  proposeSkillMd: (
+    skill: Skill,
+    skillMd: string,
+    options?: { signal?: AbortSignal },
   ) => Promise<string>;
   /**
    * Keeps a table computed by the chat as a CSV file next to the project, after

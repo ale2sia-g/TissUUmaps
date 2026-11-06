@@ -1,3 +1,4 @@
+import type { GitHubOrigin } from "./github-skills";
 import type { ProjectSkills } from "./project-skills";
 import type { SkillStorage, StoredSkill } from "./skill-storage";
 import { type FolderFile, type Skill, readSkills } from "./skills";
@@ -12,7 +13,15 @@ type SkillEntry = {
   enabled: boolean;
   /** Whether the browser remembers it for the next sessions; never for skills of the project */
   remembered: boolean;
+  /** Where a skill added from GitHub comes from */
+  github?: GitHubOrigin;
 };
+
+/** Where a skill comes from */
+export type SkillOrigin =
+  | { kind: "project"; where: string }
+  | { kind: "github"; github: GitHubOrigin }
+  | { kind: "added" };
 
 /** The section of the settings with the skills */
 export type SkillList = {
@@ -40,6 +49,35 @@ export type SkillList = {
    * @returns e.g. "/xenium/skills", or `undefined` for a skill added by hand
    */
   projectSourceOf: (skill: Skill) => string | undefined;
+  /**
+   * Where a skill comes from: the open project, GitHub, or the user
+   *
+   * @param skill - The skill
+   * @returns Its origin
+   */
+  originOf: (skill: Skill) => SkillOrigin;
+  /**
+   * Adds skills, e.g. from GitHub, in place of those with the same name
+   *
+   * @param skills - The skills
+   * @param options - Where they come from, and whether the browser remembers them
+   * @returns What happened, for the user
+   */
+  addSkills: (
+    skills: Skill[],
+    options: { github?: GitHubOrigin; remember: boolean },
+  ) => Promise<string[]>;
+  /**
+   * Gives a skill added by hand or from GitHub new instructions: another
+   * SKILL.md, with the same name
+   *
+   * @param skill - The skill
+   * @param skillMd - The text of the new SKILL.md
+   * @returns The skill with its new instructions
+   * @throws If the skill is not one added by hand or from GitHub, or the new
+   * SKILL.md is not valid
+   */
+  replaceSkillMd: (skill: Skill, skillMd: string) => Promise<Skill>;
 };
 
 /** The look of the checkboxes */
@@ -51,10 +89,11 @@ const checkboxStyle = "accent-color: var(--primary);";
  * @param entry - The skill in the list
  * @returns The skill to remember
  */
-function toStored({ skill, enabled }: SkillEntry): StoredSkill {
+function toStored({ skill, enabled, github }: SkillEntry): StoredSkill {
   return {
     name: skill.name,
     enabled,
+    ...(github === undefined ? {} : { github }),
     files: [
       { path: `${skill.name}/SKILL.md`, content: new Blob([skill.skillMd]) },
       ...[...skill.files].map(([path, content]) => ({
@@ -140,16 +179,17 @@ function makeDescription(
  *
  * @param storage - Where the skills added by hand are remembered
  * @param onChange - Called when the skills that are on change
- * @param options - Optional abort signal, for the reads
+ * @param options - What "Add skill from GitHub…" does, and an optional abort
+ * signal, for the reads
  * @returns The section, the skills that are on, and a way to show the skills
  * of the project
  */
 export function makeSkillList(
   storage: SkillStorage,
   onChange: () => void,
-  options?: { signal?: AbortSignal },
+  options?: { addFromGitHub?: () => void; signal?: AbortSignal },
 ): SkillList {
-  const { signal } = options ?? {};
+  const { signal, addFromGitHub } = options ?? {};
   /** The skills added by hand */
   const entries: SkillEntry[] = [];
   /** The skills of the open project */
@@ -172,6 +212,14 @@ export function makeSkillList(
   );
   addButton.title =
     "Choose the folder of a skill (with its SKILL.md), or a folder of skills";
+  const gitHubButton = makeButton(
+    "Add skill from GitHub…",
+    () => addFromGitHub?.(),
+    smallButtonStyle,
+  );
+  gitHubButton.title =
+    "Add the code of a GitHub repository, or of a folder of one, as a skill; you see what it holds before it is added";
+  gitHubButton.hidden = addFromGitHub === undefined;
   const rememberLabel = makeCheckbox("Remember this skill", true, () => {});
   rememberLabel.title =
     "Keep the skill in this browser for the next sessions, in every project";
@@ -179,7 +227,7 @@ export function makeSkillList(
   const header = document.createElement("div");
   header.style.cssText =
     "display: flex; flex-wrap: wrap; gap: 8px; align-items: center;";
-  header.append(title, addButton, rememberLabel, folderInput);
+  header.append(title, addButton, gitHubButton, rememberLabel, folderInput);
 
   const list = document.createElement("div");
   list.style.cssText = "display: flex; flex-direction: column; gap: 6px;";
@@ -278,11 +326,14 @@ export function makeSkillList(
       : "Off: the assistant does not see this skill";
     enabledLabel.style.fontWeight = "600";
     const tag = document.createElement("span");
-    tag.textContent = origin;
+    const { github } = entry;
+    tag.textContent = github === undefined ? origin : "GitHub";
     tag.title =
       origin === "project"
         ? `It comes with the open project, from ${projectWhere}`
-        : "You added it with Add skill…";
+        : github !== undefined
+          ? `From github.com/${github.repo}${github.path === "" ? "" : `/${github.path}`}, commit ${github.commit.slice(0, 7)}, ${github.license === undefined ? "without a license" : `license ${github.license}`}`
+          : "You added it with Add skill…";
     tag.style.cssText = `${quietTextStyle}border: 1px solid var(--border); border-radius: 6px; padding: 0 4px;`;
     const top = document.createElement("div");
     top.style.cssText =
@@ -459,7 +510,7 @@ export function makeSkillList(
     try {
       const stored = await storage.load({ signal });
       const loaded: SkillEntry[] = [];
-      for (const { name, enabled, files } of stored) {
+      for (const { name, enabled, files, github } of stored) {
         const { skills, problems } = await readSkills(files, { signal });
         loaded.push(
           ...skills.map((skill) => ({
@@ -467,6 +518,7 @@ export function makeSkillList(
             origin: "added" as const,
             enabled,
             remembered: true,
+            ...(github === undefined ? {} : { github }),
           })),
         );
         for (const { error } of problems) {
@@ -533,6 +585,85 @@ export function makeSkillList(
     }
   }
 
+  /**
+   * Adds skills, e.g. from GitHub, in place of those with the same name
+   *
+   * @param skills - The skills
+   * @param options - Where they come from, and whether the browser remembers them
+   * @returns What happened, for the user
+   */
+  async function addSkills(
+    skills: Skill[],
+    { github, remember }: { github?: GitHubOrigin; remember: boolean },
+  ): Promise<string[]> {
+    const added: SkillEntry[] = skills.map((skill) => ({
+      skill,
+      origin: "added",
+      enabled: true,
+      remembered: remember,
+      ...(github === undefined ? {} : { github }),
+    }));
+    const replaced = put(added);
+    render();
+    onChange();
+    const names = skills.map(({ name }) => name).join(", ");
+    const lines = [
+      replaced.length > 0
+        ? `Added: ${names} (replacing the one with the same name).`
+        : `Added: ${names}.`,
+    ];
+    report(lines);
+    for (const entry of added) {
+      const problem = await store(entry);
+      if (problem !== "") {
+        lines.push(problem);
+        report(lines);
+        render();
+      }
+    }
+    return lines;
+  }
+
+  /**
+   * Gives a skill added by hand or from GitHub another SKILL.md
+   *
+   * @param skill - The skill
+   * @param skillMd - The text of the new SKILL.md
+   * @returns The skill with its new instructions
+   * @throws If the skill is not one added by hand, or SKILL.md is not valid
+   */
+  async function replaceSkillMd(skill: Skill, skillMd: string): Promise<Skill> {
+    const entry = entries.find((candidate) => candidate.skill === skill);
+    if (entry === undefined) {
+      throw new Error(
+        `the skill "${skill.name}" came with the project: only skills added by hand or from GitHub can get new instructions`,
+      );
+    }
+    const { skills, problems } = await readSkills(
+      [
+        {
+          path: `${skill.name}/SKILL.md`,
+          content: new Blob([skillMd], { type: "text/plain" }),
+        },
+        ...[...skill.files].map(([path, content]) => ({
+          path: `${skill.name}/${path}`,
+          content,
+        })),
+      ],
+      { signal },
+    );
+    const [renewed] = skills;
+    if (renewed === undefined) {
+      throw new Error(problems[0]?.error ?? "the new SKILL.md cannot be read");
+    }
+    entry.skill = renewed;
+    render();
+    onChange();
+    const problem = entry.remembered ? await store(entry) : "";
+    report([problem || `${skill.name} has new instructions.`]);
+    return renewed;
+  }
+
   folderInput.addEventListener("change", () => runSafely(addChosenFolder()));
   render();
   runSafely(loadRemembered());
@@ -553,5 +684,16 @@ export function makeSkillList(
       projectEntries.some((entry) => entry.skill === skill)
         ? projectWhere
         : undefined,
+    originOf: (skill) => {
+      if (projectEntries.some((entry) => entry.skill === skill)) {
+        return { kind: "project", where: projectWhere };
+      }
+      const github = entries.find((entry) => entry.skill === skill)?.github;
+      return github === undefined
+        ? { kind: "added" }
+        : { kind: "github", github };
+    },
+    addSkills,
+    replaceSkillMd,
   };
 }

@@ -74,15 +74,17 @@ const copiedTime = 1500;
 
 /**
  * Creates a small button that copies a text, e.g. an answer or the code of a
- * script, and says for a moment whether it worked
+ * script, or an image, and says for a moment whether it worked
  *
  * @param text - The text to copy, when the button is clicked
  * @param what - What is copied, for the tooltip, e.g. "the answer"
+ * @param image - An image to copy instead of the text, e.g. a chart
  * @returns The button
  */
 export function makeCopyButton(
   text: () => string,
   what: string,
+  image?: Blob,
 ): HTMLButtonElement {
   const title = `Copy ${what}`;
   const button = makeButton(
@@ -91,9 +93,16 @@ export function makeCopyButton(
       // the clipboard is missing in pages that are not secure (http, not
       // localhost), and the browser can refuse it
       const copied =
-        typeof navigator.clipboard?.writeText === "function"
-          ? navigator.clipboard.writeText(text())
-          : Promise.reject(new Error("no clipboard"));
+        image !== undefined
+          ? typeof navigator.clipboard?.write === "function" &&
+            typeof ClipboardItem === "function"
+            ? navigator.clipboard.write([
+                new ClipboardItem({ [image.type]: image }),
+              ])
+            : Promise.reject(new Error("no clipboard"))
+          : typeof navigator.clipboard?.writeText === "function"
+            ? navigator.clipboard.writeText(text())
+            : Promise.reject(new Error("no clipboard"));
       copied
         .then(() => {
           button.textContent = "Copied";
@@ -255,6 +264,8 @@ export const toolIcons: Record<string, string> = {
   run_script: "🧪",
   run_code: "🧮",
   save_computed_table: "💾",
+  add_skill_from_github: "📦",
+  propose_skill_instructions: "📝",
 };
 
 /**

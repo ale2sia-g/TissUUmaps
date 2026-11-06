@@ -1,3 +1,5 @@
+import { maxCharts } from "./charts";
+import { findSkill } from "./skill-tools";
 import type { ToolArguments, ToolContext } from "./types";
 
 // The strong models can write their own JavaScript or Python for what their
@@ -21,7 +23,7 @@ export const runCodeDefinition = {
       "Run JavaScript or Python that you write, to compute anything on the data of the tables that the summary does not answer: " +
       "statistics, comparisons, correlations, thresholds, spatial analyses with the coordinates. No skill is needed. " +
       "It runs in a sandbox, where it can read the data of the project but not change it; the user sees its code. " +
-      "Returns what the code returns, and what it logs or prints.",
+      "Returns what the code returns, and what it logs or prints; in Python, the matplotlib figures it draws are shown to the user.",
     parameters: {
       type: "object",
       required: ["title", "code"],
@@ -42,6 +44,11 @@ export const runCodeDefinition = {
           description:
             "JavaScript: a module, export default async function (tm) { ... }. " +
             "Python: a function async def main(tm): ... Either returns a small result.",
+        },
+        skill: {
+          type: "string",
+          description:
+            "Only to use the files of a skill that is on, e.g. one from GitHub: its name. Python can then import its modules, and tm.read_file (tm.readFile) reads its files.",
         },
       },
     },
@@ -114,7 +121,12 @@ export const codeInstructions = [
   "  of the same table belong together row by row; in Python, a numpy array (of objects,",
   "  for text such as cluster names)",
   "- tm.project: a copy of the app state, the same JSON as in the context",
+  "- with skill (the name of a skill that is on): await tm.readFile(path) in JavaScript,",
+  "  await tm.read_file(path) in Python, reads a file of the skill; Python imports its modules",
   "- tm.progress(text): shows how far it is, for long computations",
+  "- await tm.download(name, text): gives the user a file of text (.csv, .tsv, .txt, .json",
+  '  or .md, e.g. "zscores.csv" with frame.to_csv()), which the chat shows with Save; only',
+  "  when the user asks for a file, e.g. of a table that is not one value per row",
   "- await tm.saveColumn(table, name, values) in JavaScript, await tm.save_column(table,",
   "  name, values) in Python: saves a result as a column, one value per row of the table, in",
   "  the order of tm.read (or with the item IDs of the values: { ids } in JavaScript, ids=",
@@ -139,11 +151,20 @@ export const codeInstructions = [
   "not count): in big tables go over the rows only a few times, and for neighbors use a",
   "grid or a k-d tree instead of comparing every pair.",
   "",
-  "What you cannot do yet: read the pixels of images, or draw charts or plots (the result",
-  "is text: give the numbers, or a small table, in your answer). The code has no internet:",
+  "# Charts",
+  "In Python you can draw charts with matplotlib (import matplotlib.pyplot as plt): every",
+  "figure still open when the code ends is shown to the user in the chat, as an image they",
+  "can copy and save. You do not see it: you get only a short description (titles, axes,",
+  "what each plot holds), so say what it shows only from that and from the numbers. Give",
+  "each chart a title and labeled axes; do not call plt.show() or plt.savefig(). Draw one",
+  `when the user asks for a chart, or when it shows a result much better than numbers; at`,
+  `most ${maxCharts} per code. JavaScript cannot draw charts. Also give the main numbers in your answer.`,
+  "",
+  "What you cannot do yet: read the pixels of images. The code has no internet:",
   "it cannot download anything, and in Python only the packages of Pyodide can be imported",
   "(no pip or micropip, and no packages such as squidpy or scanpy). It cannot change the",
-  "data of the project or save files: it can only save columns with tm.saveColumn. When a",
+  "data of the project or save files itself: it can only save columns with tm.saveColumn,",
+  "and give the user files with tm.download. When a",
   "request needs one of these, say so, and offer what you can do instead.",
   "Return a small result (counts, summaries, a small DataFrame, at most a few hundred",
   "values), never whole columns: it comes back to you as text, and what the code logs with",
@@ -180,6 +201,14 @@ export async function runCodeTool(
       ? "Error: code is missing: give Python with a function async def main(tm): ..."
       : "Error: code is missing: give a JavaScript module, export default async function (tm) { ... }.";
   }
+  let skill;
+  if (args["skill"] !== undefined && args["skill"] !== "") {
+    const found = findSkill(context.skills, args["skill"]);
+    if (typeof found === "string") {
+      return found;
+    }
+    skill = found;
+  }
   const given = args["title"];
   const title =
     (typeof given === "string" ? given.trim().replace(/\s+/g, " ") : "") ||
@@ -188,7 +217,12 @@ export async function runCodeTool(
     title.length > maxTitle ? `${title.slice(0, maxTitle - 1)}…` : title,
     code,
     python ? "python" : "javascript",
-    { signal, progress: context.progress, changes: context.changes },
+    {
+      signal,
+      progress: context.progress,
+      changes: context.changes,
+      ...(skill === undefined ? {} : { skill }),
+    },
   );
 }
 

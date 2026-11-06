@@ -1,3 +1,4 @@
+import { maxCharts } from "./charts";
 import { type PythonFiles, coreFiles, lockFile } from "./python-files";
 import {
   type ScriptOutcome,
@@ -20,21 +21,30 @@ import {
 const contentSecurityPolicy =
   "default-src 'none'; script-src 'unsafe-inline' blob: 'wasm-unsafe-eval'; worker-src blob:";
 
+/** The folder of the files of a skill, whose modules its code can import */
+const skillFolder = "/skill";
+
 /**
  * The Python side of the sandbox: runs the code of a script with fresh
  * names, and gives it tm, like tm of JavaScript but with numpy arrays
  */
 const driver = [
+  "import ast",
+  "import importlib",
   "import inspect",
   "import json",
   "import os",
+  "import shutil",
   "import sys",
   "",
   "import js",
   "from pyodide.ffi import to_js",
   "",
-  "# figures are drawn into images, never into a window",
+  "# figures are drawn into images, never into a window; plt.show() does nothing",
   'os.environ["MPLBACKEND"] = "Agg"',
+  "import warnings",
+  "",
+  'warnings.filterwarnings("ignore", message=".*non-interactive.*")',
   "",
   "",
   "class _Tm:",
@@ -83,6 +93,12 @@ const driver = [
   '            question["ids"] = to_js(np.asarray(ids).ravel().tolist())',
   "        return (await self._question(**question)).to_py()",
   "",
+  "    async def download(self, name, text):",
+  '        """Gives the user a file of text, e.g. a table as CSV"""',
+  "        if not isinstance(text, str):",
+  '            raise TypeError("give the text of the file, e.g. frame.to_csv()")',
+  '        return (await self._question(kind="download", name=name, text=text)).to_py()',
+  "",
   "    def progress(self, text):",
   "        self._progress(str(text))",
   "",
@@ -102,10 +118,204 @@ const driver = [
   "    )",
   "",
   "",
-  "async def _run(code, ask, progress, args, project, skill_dir):",
-  "    if skill_dir and skill_dir not in sys.path:",
-  "        sys.path.insert(0, skill_dir)",
+  `SKILL = "${skillFolder}"`,
+  "",
+  "",
+  "def _of_skill(module):",
+  '    file = getattr(module, "__file__", None) or ""',
+  '    folders = [str(path) for path in getattr(module, "__path__", None) or []]',
+  "    return any(path.startswith(SKILL) for path in [file, *folders])",
+  "",
+  "",
+  "def _clear_skill():",
+  '    """Forgets the files and the modules of the skill of the run before"""',
+  "    for name, module in list(sys.modules.items()):",
+  "        if _of_skill(module):",
+  "            del sys.modules[name]",
+  "    sys.path[:] = [path for path in sys.path if not path.startswith(SKILL)]",
+  "    for path in list(sys.path_importer_cache):",
+  "        if path.startswith(SKILL):",
+  "            del sys.path_importer_cache[path]",
+  "    shutil.rmtree(SKILL, ignore_errors=True)",
+  "    importlib.invalidate_caches()",
+  "",
+  "",
+  "def _skill_paths(has_files, script):",
+  '    """Where the modules of the skill are: as Python does, the folder of the',
+  '    script first, then the folder of the skill, and its src folder if any"""',
+  "    if not has_files:",
+  '        return "[]"',
+  "    paths = []",
+  '    if "/" in script:',
+  "        paths.append(os.path.join(SKILL, os.path.dirname(script)))",
+  "    paths.append(SKILL)",
+  '    if os.path.isdir(f"{SKILL}/src"):',
+  '        paths.append(f"{SKILL}/src")',
+  "    return json.dumps(paths)",
+  "",
+  "",
+  "def _find_local(name, paths):",
+  '    """The file of a module of the skill (\'\' for a folder without',
+  '    __init__.py), or None for a module that is not of the skill"""',
+  '    parts = name.split(".")',
+  "    for root in paths:",
+  "        base = os.path.join(root, *parts)",
+  '        if os.path.isfile(base + ".py"):',
+  '            return base + ".py"',
+  '        if os.path.isfile(os.path.join(base, "__init__.py")):',
+  '            return os.path.join(base, "__init__.py")',
+  "        if os.path.isdir(base):",
+  '            return ""',
+  "    return None",
+  "",
+  "",
+  "def _imports_of(source, package):",
+  '    """The modules that some code imports, also those in functions"""',
+  "    try:",
+  "        tree = ast.parse(source)",
+  "    except SyntaxError:",
+  "        return []",
+  "    names = []",
+  "    for node in ast.walk(tree):",
+  "        if isinstance(node, ast.Import):",
+  "            names.extend(alias.name for alias in node.names)",
+  "        elif isinstance(node, ast.ImportFrom):",
+  '            module = node.module or ""',
+  "            if node.level:",
+  '                parts = package.split(".") if package else []',
+  "                parts = parts[: len(parts) - node.level + 1]",
+  '                module = ".".join(parts + ([module] if module else []))',
+  "            if module:",
+  "                names.append(module)",
+  '                names.extend(f"{module}.{alias.name}" for alias in node.names if alias.name != "*")',
+  "    return names",
+  "",
+  "",
+  "def _imports_needed(code, paths):",
+  '    """The modules that the code imports, and the modules of the skill that it',
+  '    imports, which are not of the skill: the packages of Pyodide to load"""',
+  "    paths = json.loads(paths)",
+  "    outside = set()",
+  "    seen = set()",
+  '    todo = [(code, "")]',
+  "    while todo:",
+  "        source, package = todo.pop()",
+  "        for name in _imports_of(source, package):",
+  '            parts = name.split(".")',
+  "            if _find_local(parts[0], paths) is None:",
+  "                outside.add(parts[0])",
+  "                continue",
+  "            for end in range(1, len(parts) + 1):",
+  '                module = ".".join(parts[:end])',
+  "                path = _find_local(module, paths)",
+  "                if path and path not in seen:",
+  "                    seen.add(path)",
+  '                    with open(path, encoding="utf-8", errors="replace") as file:',
+  "                        text = file.read()",
+  '                    inside = module if path.endswith("__init__.py") else module.rpartition(".")[0]',
+  "                    todo.append((text, inside))",
+  '    return "\\n".join(f"import {name}" for name in sorted(outside))',
+  "",
+  "",
+  `MAX_CHARTS = ${maxCharts}`,
+  "",
+  "",
+  "def _close_figures():",
+  '    pyplot = sys.modules.get("matplotlib.pyplot")',
+  "    if pyplot is not None:",
+  '        pyplot.close("all")',
+  "",
+  "",
+  "def _is_number(text):",
+  "    try:",
+  '        float(text.replace("−", "-"))',
+  "        return True",
+  "    except ValueError:",
+  "        return False",
+  "",
+  "",
+  "def _labels(texts, words_only=False, most=30):",
+  '    """e.g. " [B cells, T cells]"; for an axis, only names, not numbers"""',
+  "    names = [text.get_text() for text in texts if text.get_text()]",
+  "    if not names or len(names) > most or (words_only and all(map(_is_number, names))):",
+  '        return ""',
+  '    return " [" + ", ".join(names) + "]"',
+  "",
+  "",
+  "def _describe_axes(axes):",
+  '    """What a plot shows, in words, for the model, which does not see it"""',
+  '    colorbar = getattr(axes, "_colorbar", None)',
+  "    if colorbar is not None:",
+  "        label = axes.get_ylabel() or axes.get_xlabel()",
+  '        text = f"color scale {label!r}" if label else "color scale"',
+  "        low, high = colorbar.norm.vmin, colorbar.norm.vmax",
+  "        if low is not None and high is not None:",
+  '            text += f" from {low:.4g} to {high:.4g}"',
+  "        return text",
+  "    parts = []",
+  "    if axes.get_title():",
+  "        parts.append(repr(axes.get_title()))",
+  "    for name, label, limits, ticks in [",
+  '        ("x", axes.get_xlabel(), axes.get_xlim(), axes.get_xticklabels()),',
+  '        ("y", axes.get_ylabel(), axes.get_ylim(), axes.get_yticklabels()),',
+  "    ]:",
+  '        text = f"{name} axis {label!r}" if label else f"{name} axis"',
+  '        parts.append(f"{text} from {limits[0]:.4g} to {limits[1]:.4g}{_labels(ticks, True)}")',
+  "    held = []",
+  "    if axes.lines:",
+  '        held.append(f"{len(axes.lines)} line(s)")',
+  "    bars = sum(len(container) for container in axes.containers)",
+  "    if bars:",
+  '        held.append(f"{bars} bar(s)")',
+  "    if axes.collections:",
+  '        held.append(f"{len(axes.collections)} collection(s) of marks, e.g. scatter points")',
+  "    if axes.images:",
+  '        held.append(f"{len(axes.images)} image(s), e.g. a heatmap")',
+  "    if held:",
+  '        parts.append("with " + ", ".join(held))',
+  "    legend = axes.get_legend()",
+  "    if legend is not None:",
+  '        parts.append("legend" + _labels(legend.get_texts()))',
+  '    return "; ".join(parts)',
+  "",
+  "",
+  "def _charts():",
+  '    """The figures that the code left open, as PNG images, each with what it',
+  '    shows in words; then they are closed"""',
+  "    import io",
+  "",
+  '    pyplot = sys.modules.get("matplotlib.pyplot")',
+  "    if pyplot is None:",
+  "        return []",
+  "    charts = []",
+  "    for number in pyplot.get_fignums()[:MAX_CHARTS]:",
+  "        figure = pyplot.figure(number)",
+  "        # at most about 2000 pixels on a side",
+  "        dpi = min(100, 2000 / max(*figure.get_size_inches(), 1))",
+  "        image = io.BytesIO()",
+  "        # the warnings of matplotlib itself are not for the model",
+  "        with warnings.catch_warnings():",
+  '            warnings.simplefilter("ignore")',
+  '            figure.savefig(image, format="png", dpi=dpi, bbox_inches="tight")',
+  '        title = figure._suptitle.get_text() if figure._suptitle is not None else ""',
+  "        plots = [_describe_axes(axes) for axes in figure.axes]",
+  '        description = (f"{title!r}: " if title else "") + " | ".join(plots)',
+  '        charts.append({"png": to_js(image.getvalue()), "description": description})',
+  "    hidden = len(pyplot.get_fignums()) - len(charts)",
+  "    _close_figures()",
+  "    if hidden > 0:",
+  '        print(f"{hidden} more figure(s) not shown: at most {MAX_CHARTS} per run")',
+  "    return charts",
+  "",
+  "",
+  "async def _run(code, ask, progress, args, project, paths, script):",
+  "    # no figure of the run before",
+  "    _close_figures()",
+  "    for path in reversed(json.loads(paths)):",
+  "        sys.path.insert(0, path)",
   '    namespace = {"__name__": "__script__"}',
+  "    if script:",
+  '        namespace["__file__"] = f"{SKILL}/{script}"',
   '    exec(compile(code, "<script>", "exec"), namespace)',
   '    main = namespace.get("main")',
   "    if not callable(main):",
@@ -115,8 +325,19 @@ const driver = [
   "    result = main(_Tm(ask, progress, json.loads(args), json.loads(project)))",
   "    if inspect.isawaitable(result):",
   "        result = await result",
-  "    return _text(result)",
+  "    return to_js(",
+  '        {"result": _text(result), "charts": _charts()},',
+  "        dict_converter=js.Object.fromEntries,",
+  "    )",
 ].join("\n");
+
+/** Python code to run, with the files of its skill, if any */
+export type PythonRun = ScriptRun & {
+  /** The files of the skill, by their path in it; its code can import them */
+  files?: Record<string, ArrayBuffer>;
+  /** The path of the script in the skill, e.g. "scripts/stats.py" */
+  path?: string;
+};
 
 /** What the worker needs of Pyodide */
 type Pyodide = {
@@ -154,7 +375,7 @@ type ToWorker =
   | {
       type: "run";
       id: number;
-      run: ScriptRun & { files?: Record<string, ArrayBuffer> };
+      run: PythonRun;
     };
 
 /** What the worker sends to the panel */
@@ -261,31 +482,40 @@ function workerMain(load: (url: string) => Promise<unknown>): void {
     pyodide.runPython(message.driver);
   }
 
+  // calls a function of the driver, which gives back text
+  const callDriver = (name: string, ...values: unknown[]) => {
+    const driverFunction = pyodide.globals.get(name);
+    try {
+      return driverFunction(...values) as unknown as string;
+    } finally {
+      driverFunction.destroy();
+    }
+  };
+
   async function run(message: Extract<ToWorker, { type: "run" }>) {
-    const { code, args, project, files: scriptFiles } = message.run;
+    const { code, args, project, files: scriptFiles, path = "" } = message.run;
     const logs: string[] = [];
-    // the files of a skill, which its scripts can import
+    // the files of a skill, which its code can import (the same folder as
+    // skillFolder); nothing of the skill of the run before stays
     const folder = "/skill";
-    for (const [path, buffer] of Object.entries(scriptFiles ?? {})) {
-      const full = `${folder}/${path}`;
+    callDriver("_clear_skill");
+    for (const [file, buffer] of Object.entries(scriptFiles ?? {})) {
+      const full = `${folder}/${file}`;
       pyodide.FS.mkdirTree(full.slice(0, full.lastIndexOf("/")));
       pyodide.FS.writeFile(full, new Uint8Array(buffer));
     }
-    // the packages of Pyodide that the code imports, from the panel
+    const paths = callDriver("_skill_paths", scriptFiles !== undefined, path);
+    // the packages of Pyodide that the code imports, also through the
+    // modules of the skill, from the panel
     servePyodideFiles(true);
     try {
-      const sources = [
-        code,
-        ...Object.entries(scriptFiles ?? {})
-          .filter(([path]) => path.endsWith(".py"))
-          .map(([, buffer]) => new TextDecoder().decode(buffer)),
-      ];
-      for (const source of sources) {
-        await pyodide.loadPackagesFromImports(source, {
+      await pyodide.loadPackagesFromImports(
+        callDriver("_imports_needed", code, paths),
+        {
           messageCallback: () => {},
           errorCallback: (text) => logs.push(text),
-        });
-      }
+        },
+      );
     } finally {
       servePyodideFiles(false);
     }
@@ -294,15 +524,27 @@ function workerMain(load: (url: string) => Promise<unknown>): void {
     pyodide.setStderr({ batched: (line) => logs.push(line) });
     const runner = pyodide.globals.get("_run");
     try {
-      const result = await runner(
+      const { result, charts } = (await runner(
         code,
         (question: unknown) => ask({ type: "question", question }),
         (text: string) => port.postMessage({ type: "progress", text }),
         JSON.stringify(args ?? null),
         JSON.stringify(project ?? null),
-        scriptFiles === undefined ? "" : folder,
-      );
-      return { result, logs };
+        paths,
+        path,
+      )) as unknown as {
+        result: string;
+        charts: { png: Uint8Array; description: string }[];
+      };
+      return {
+        result,
+        logs,
+        // each image in a buffer of its own, which the panel checks
+        charts: charts.map(({ png, description }) => ({
+          png: png.slice().buffer,
+          description,
+        })),
+      };
     } catch (error) {
       return { error: shortError(error), logs };
     } finally {
@@ -356,7 +598,7 @@ export type PythonKernel = {
    * stopped too
    */
   run: (
-    run: ScriptRun & { files?: Record<string, ArrayBuffer> },
+    run: PythonRun,
     answer: (question: ScriptQuestion) => Promise<unknown>,
     options: {
       timeLimit: number;

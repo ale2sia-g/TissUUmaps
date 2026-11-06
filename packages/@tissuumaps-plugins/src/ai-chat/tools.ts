@@ -14,7 +14,13 @@ import {
   showOnly,
 } from "./object-tools";
 import { itemsKinds, objectKinds } from "./objects";
-import { loadSkill, readSkillFile, runScriptTool } from "./skill-tools";
+import {
+  addSkillFromGitHub,
+  loadSkill,
+  proposeSkillInstructions,
+  readSkillFile,
+  runScriptTool,
+} from "./skill-tools";
 import type { Tool } from "./types";
 
 /** The ids parameter that most tools share */
@@ -283,6 +289,8 @@ export const tools: Record<string, Tool> = {
   run_script: runScriptTool,
   run_code: runCodeTool,
   save_computed_table: saveComputedTableTool,
+  add_skill_from_github: addSkillFromGitHub,
+  propose_skill_instructions: proposeSkillInstructions,
 };
 
 /** The tools only offered to OpenAI and Anthropic, which know the whole app */
@@ -293,4 +301,6 @@ export const wholeAppTools = [
   "run_script",
   "run_code",
   "save_computed_table",
+  "add_skill_from_github",
+  "propose_skill_instructions",
 ];

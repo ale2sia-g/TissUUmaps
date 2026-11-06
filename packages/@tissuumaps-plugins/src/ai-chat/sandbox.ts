@@ -21,7 +21,8 @@ export type ScriptQuestion =
       column: string;
       values: unknown;
       ids?: unknown;
-    };
+    }
+  | { kind: "download"; name: unknown; text: unknown };
 
 /** A script to run */
 export type ScriptRun = {
@@ -41,6 +42,12 @@ export type ScriptOutcome = {
   error?: string;
   /** What the script logged with console.log and the like */
   logs: string[];
+  /**
+   * The charts that Python code drew, for the user only: each image, which
+   * should be a PNG (the panel checks it), and what it shows in words, for
+   * the model
+   */
+  charts?: { png: ArrayBuffer; description: string }[];
 };
 
 /** The policy of the sandbox: no network, no other scripts, no eval */
@@ -131,6 +138,8 @@ function workerMain(load: (url: string) => Promise<unknown>): void {
           values,
           ...(options?.ids === undefined ? {} : { ids: options.ids }),
         }),
+      download: (name: unknown, text: unknown) =>
+        ask({ kind: "download", name, text }),
       progress: (text: unknown) =>
         port.postMessage({ type: "progress", text: toText(text) }),
     });

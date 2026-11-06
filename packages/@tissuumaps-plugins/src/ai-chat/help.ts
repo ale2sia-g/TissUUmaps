@@ -124,13 +124,21 @@ export const helpText = `How to use this chat
    With OpenAI and Anthropic, the assistant sees the names
    and descriptions of the skills that are on, and reads a skill's instructions
    only when a request needs them. Ollama's models do not use skills.
-   A skill can also bring JavaScript scripts, e.g. to compute on the data. Each
+   A skill can also bring scripts, in JavaScript or Python, e.g. to compute on
+   the data. Each
    is shown in the chat before it runs, as one line (📜): click it to read its
    code. They run in a sandbox:
    they can read the data, but cannot change the project, use the internet or
    see your API key. "Stop" stops a script, and after two minutes it stops by
    itself. Before the scripts of a skill that came with the project run for the
    first time, their code opens and you are asked.
+   "Add skill from GitHub…" adds the code of a GitHub repository (or of a
+   folder of one) as a skill; you can also give its address in the chat. You
+   first see its commit, its license (with a warning if it has none), its
+   files, the Python packages it needs and what will not work, and nothing is
+   added unless you say yes. Only text and code are kept, and notebooks
+   without their outputs. Without a SKILL.md, the chat writes a minimal one;
+   it can later propose better instructions, which you confirm.
 
 12. Computing on the data
    With OpenAI and Anthropic, the assistant can also answer questions that need
@@ -147,8 +155,10 @@ export const helpText = `How to use this chat
    the line of the tool shows how far it is, with "Stop". The files are checked
    and kept in this browser, so the next time Python starts in a few seconds;
    "Forget Python files", in the settings, removes them. Python only works in a
-   secure page (https, or localhost). It cannot yet read the pixels of images
-   or draw charts.
+   secure page (https, or localhost). It cannot yet read the pixels of images.
+   In Python it can also draw charts (matplotlib): they are shown in the chat,
+   with "Copy" and "Save" (a PNG file). The model does not see them: it only
+   gets a short description of each, with its titles and axes.
    To show a result on the image (e.g. "color the cells by the number of their
    neighbors"), the program saves it as a new column of a table of its own,
    e.g. "cells (chat)"; the original data is never changed, and "Undo" takes

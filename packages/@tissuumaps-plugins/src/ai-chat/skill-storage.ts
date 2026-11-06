@@ -1,3 +1,4 @@
+import type { GitHubOrigin } from "./github-skills";
 import type { FolderFile } from "./skills";
 
 // The skills added by hand with "Remember this skill" are kept in IndexedDB,
@@ -13,6 +14,8 @@ export type StoredSkill = {
   enabled: boolean;
   /** The files, by path from the skill's folder, e.g. "stats/SKILL.md" */
   files: FolderFile[];
+  /** Where a skill from GitHub comes from */
+  github?: GitHubOrigin;
 };
 
 /** Where the panel remembers the skills added by hand */
