@@ -226,7 +226,7 @@ export const storeTypes = [
   "setExpandedShapesIds(expandedShapesIds:string[]) // Sets the shapes whose entries are expanded in the Shapes panel",
   "setExpandedTableIds(expandedTableIds:string[]) // Sets the tables whose entries are expanded in the Tables panel",
   "}",
-  'type InteractionMode="pan"|"drawRectangle"|"drawPolygon"|"drawFreehand" // Interaction mode, determining how mouse events are interpreted',
+  'type InteractionMode="pan"|"drawRectangle"|"drawPolygon"|"drawFreehand" // One of the interaction modes of the InteractionMode object',
   "type ImageChannelPreview={ // A single image channel shown on its own, without touching the project",
   "imageId:string // The ID of the previewed image",
   "channelIndex:number // The index of the previewed channel (0-based)",
