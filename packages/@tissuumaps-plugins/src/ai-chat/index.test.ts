@@ -4164,7 +4164,7 @@ describe("aiChatPlugin", () => {
       expect([python.starts, python.stops]).toEqual([1, 0]);
 
       // a new one after New chat, and after another project is opened
-      vi.spyOn(window, "confirm").mockReturnValue(true);
+      const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
       panel.button("New chat").click();
       expect(python.stops).toBe(1);
       services.answers = [{ toolCalls: [runPython()] }, { content: "1." }];
@@ -4172,6 +4172,8 @@ describe("aiChatPlugin", () => {
       expect(python.starts).toBe(2);
       panel.projectStore.openOtherProject({ name: "other" });
       expect(python.stops).toBe(2);
+      // the panel asks a moment later whether to clear the conversation
+      await vi.waitFor(() => expect(confirm).toHaveBeenCalledTimes(2));
     });
 
     it("shows the download of Python with a Stop button, and starts again after a stop", async () => {
