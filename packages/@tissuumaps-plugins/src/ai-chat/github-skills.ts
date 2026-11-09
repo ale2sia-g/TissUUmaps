@@ -478,8 +478,9 @@ export async function readGitHubSkill(
     let named = skillName(path.split("/").at(-1) || repo);
     try {
       const { fields } = parseFrontmatter(ownSkillMd);
-      if (typeof fields["name"] === "string" && fields["name"] !== "") {
-        named = fields["name"];
+      const name = fields.get("name");
+      if (typeof name === "string" && name !== "") {
+        named = name;
       }
     } catch {
       // readSkills says what is wrong with it

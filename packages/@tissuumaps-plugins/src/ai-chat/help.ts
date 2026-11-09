@@ -149,6 +149,8 @@ export const helpText = `How to use this chat
    thresholds and spatial analyses with the coordinates of the cells all work.
    The program is shown in the chat before it runs, as one line (📜): click it
    to read the code. "Stop" stops it, and after two minutes it stops by itself.
+   In one request the assistant calls its tools at most 15 times in a row (5
+   with Ollama); then it answers with what it found, and you can ask it to go on.
    Simple computations are in JavaScript; statistical tests, models and the
    like in Python, with numpy, scipy, pandas and scikit-learn. The first time,
    Python is downloaded (about 14 MB, up to about 40 MB with its packages), and
@@ -156,9 +158,13 @@ export const helpText = `How to use this chat
    and kept in this browser, so the next time Python starts in a few seconds;
    "Forget Python files", in the settings, removes them. Python only works in a
    secure page (https, or localhost). It cannot yet read the pixels of images.
-   In Python it can also draw charts (matplotlib): they are shown in the chat,
-   with "Copy" and "Save" (a PNG file). The model does not see them: it only
-   gets a short description of each, with its titles and axes.
+   In Python it can also draw charts (matplotlib): they are shown in the chat
+   as "Chart 1", "Chart 2"..., with "Copy" and "Save" (a PNG file). The model
+   usually gets only a short description of each, with its titles and axes.
+   Ask it to look at one ("look at the chart and tell me what you see"): it
+   then sees that image, for that answer only. With "Let the model see charts",
+   in the settings, it sees every chart it draws. Each image costs about as
+   much as a page of text (see "Usage"). Only OpenAI and Anthropic see images.
    To show a result on the image (e.g. "color the cells by the number of their
    neighbors"), the program saves it as a new column of a table of its own,
    e.g. "cells (chat)"; the original data is never changed, and "Undo" takes
@@ -168,6 +174,16 @@ export const helpText = `How to use this chat
    file, and propose one with the table, its columns and the day; you can
    also tell the assistant the name, e.g. "save it as neighbors.csv".
 
+13. Web search
+   With OpenAI and Anthropic, the assistant can search the web (e.g. for recent
+   papers or the documentation of a tool) once you turn on "Allow web search"
+   in the settings (⚙). It is off until you turn it on; while it is off, the
+   assistant tells you when a question needs it. Each search costs about 1 cent
+   (see "Usage"). The searches are shown above the answer (🌐), and the sources
+   under it, with the icon and the name of each site: click one to open the
+   page. The assistant treats the text of web pages as information, never as
+   instructions. The code in the sandbox never gets the internet.
+
 What the assistant can do: answer questions about the open project, show or hide
 images, labels, points and shapes, make them more or less transparent, make
 points bigger or smaller, color labels and points by a column of their table
@@ -175,4 +191,5 @@ points bigger or smaller, color labels and points by a column of their table
 give them one color (e.g. "color the cell circles green"),
 and show only some groups (e.g. "show only clusters 1 and 3", then "show all the
 cells again"). With OpenAI and Anthropic, it can also compute on the data (see
-12). It cannot change or delete anything else.`;
+12) and, if you allow it, search the web (see 13). It cannot change or delete
+anything else.`;

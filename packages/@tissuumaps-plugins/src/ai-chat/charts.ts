@@ -90,3 +90,20 @@ export function chartFileName(
       .replace(/-+$/, "") || "chart";
   return `${base}${count > 1 ? `-${number}` : ""}.png`;
 }
+
+/**
+ * Writes an image in base64, as the services want the images that the model
+ * sees
+ *
+ * @param buffer - The image
+ * @returns Its bytes in base64
+ */
+export function toBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let text = "";
+  // in pieces, since a call takes only so many arguments
+  for (let start = 0; start < bytes.length; start += 0x8000) {
+    text += String.fromCharCode(...bytes.subarray(start, start + 0x8000));
+  }
+  return btoa(text);
+}

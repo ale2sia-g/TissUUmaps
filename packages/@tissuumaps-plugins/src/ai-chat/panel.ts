@@ -7,9 +7,10 @@ import {
 } from "@tissuumaps/core";
 
 import { callActionDefinition, describeAction } from "./call-action";
-import { chartFileName, checkPng, maxCharts } from "./charts";
+import { chartFileName, checkPng, maxCharts, toBase64 } from "./charts";
 import {
   codeInstructions,
+  lookAtChartDefinition,
   runCodeDefinition,
   saveComputedTableDefinition,
 } from "./code-tool";
@@ -50,6 +51,7 @@ import {
   type OllamaPullUpdate,
   type Provider,
   type ProviderId,
+  type Source,
   type Usage,
   explainNotReachable,
   hideKey,
@@ -84,8 +86,11 @@ import {
 import type { Skill } from "./skills";
 import { buildContext, exampleRequests, stateJson } from "./summary";
 import {
+  columnsForCode,
   describeMatrix,
+  describeMatrixReading,
   describeValues,
+  findCoordinates,
   findUsedColumns,
   linkedTables,
   listColumns,
@@ -93,7 +98,7 @@ import {
   maxRowsToRead,
   objectTables,
 } from "./tables";
-import { toolDefinitions, tools, wholeAppTools } from "./tools";
+import { imageTools, toolDefinitions, tools, wholeAppTools } from "./tools";
 import type {
   Change,
   ColumnInfo,
@@ -123,9 +128,26 @@ import {
   usesOllama,
 } from "./ui";
 import { currentValue, describeValueChange, handNote, takeBack } from "./undo";
+import {
+  describeSearches,
+  makeSourcesRow,
+  webInstructions,
+  webSearchState,
+} from "./web";
 
-/** How many times in a row the model may call tools before it is stopped */
-const maxSteps = 5;
+/**
+ * How many times in a row the strong models of OpenAI and Anthropic may call
+ * tools in one request before they must answer: a skill often takes several
+ * steps, e.g. to load it, read its files, find the columns and run the code
+ */
+const maxSteps = 15;
+
+/** The same for the small local models of Ollama */
+const maxStepsLocal = 5;
+
+/** Told to the model with the results of its last step of tools */
+const lastStepNote =
+  "(Note from the chat: this was the last step of tools for this request. Now answer the user without calling tools, with what you found: the results, what is still missing, and what the user can ask next to go on.)";
 
 /** The longest time a script of a skill may run, in milliseconds */
 const scriptTimeLimit = 120_000;
@@ -195,6 +217,8 @@ export function mountAiChat(
   let persona = personaFor(settingsStore.getState().dark);
   /** The indicator shown in the chat while the model thinks */
   let thinking: { element: HTMLElement; stop: () => void } | null = null;
+  /** The message added last to the history, e.g. an answer of the model */
+  let lastFrame: HTMLElement | null = null;
 
   /** About how much the answers cost since the panel was opened, in dollars */
   let sessionCost = 0;
@@ -303,6 +327,67 @@ export function mountAiChat(
   toolDetailsLabel.title =
     "Show the calls and the results of the tools, instead of one line each";
   toolDetailsLabel.append(toolDetailsBox, " Show tool details");
+
+  /**
+   * Makes a checkbox of the settings that is off unless the user turns it
+   * on, remembered by the browser
+   *
+   * @param setting - Its name in the browser's memory
+   * @param text - Its label
+   * @param title - Its tooltip
+   * @param onChange - Called with the new value
+   * @returns The label with the checkbox
+   */
+  function makeOption(
+    setting: string,
+    text: string,
+    title: string,
+    onChange: (on: boolean) => void,
+  ): HTMLLabelElement {
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = loadSetting(setting) === "true";
+    box.style.accentColor = "var(--primary)";
+    box.addEventListener("change", () => {
+      saveSetting(setting, box.checked ? "true" : null);
+      onChange(box.checked);
+    });
+    const label = document.createElement("label");
+    label.title = title;
+    label.append(box, ` ${text}`);
+    return label;
+  }
+
+  /**
+   * Whether the model gets the image of every chart that its code draws,
+   * remembered by the browser; without it, only when it looks at one
+   */
+  let seeCharts = loadSetting("seeCharts") === "true";
+  const seeChartsLabel = makeOption(
+    "seeCharts",
+    "Let the model see charts",
+    "With OpenAI and Anthropic: send the image of every chart to the model, so that it can say what it shows. " +
+      "Each image costs about a thousand tokens (see Usage). When this is off, the model sees a chart only when you ask it to look at one.",
+    (on) => {
+      seeCharts = on;
+    },
+  );
+  /** Whether the model may search the web, remembered by the browser */
+  let webSearch = loadSetting("webSearch") === "true";
+  const webSearchLabel = makeOption(
+    "webSearch",
+    "Allow web search",
+    "With OpenAI and Anthropic: the model may search the web, e.g. for papers or documentation. " +
+      "Each search costs about 1 cent (see Usage), and the sources are shown under the answer. The code in the sandbox never gets the internet.",
+    (on) => {
+      webSearch = on;
+      updateLayout();
+    },
+  );
+  const optionsRow = document.createElement("div");
+  optionsRow.style.cssText =
+    "display: flex; flex-wrap: wrap; gap: 4px 16px; align-items: center;";
+  optionsRow.append(toolDetailsLabel, seeChartsLabel, webSearchLabel);
 
   const status = document.createElement("span");
   status.setAttribute("role", "status");
@@ -417,7 +502,7 @@ export function mountAiChat(
     serviceRow,
     keyRow,
     statusRow,
-    toolDetailsLabel,
+    optionsRow,
     skillList.element,
     pythonRow,
   );
@@ -427,10 +512,10 @@ export function mountAiChat(
     "flex: 1; min-height: 100px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px;" +
     "padding: 8px; border: 1px solid var(--border); border-radius: 6px;";
 
-  // one row above the text box, which scrolls sideways if it is too long
+  // above the text box; the suggestions go on to a new line instead of
+  // scrolling sideways, and stay quiet
   const examplesRow = document.createElement("div");
-  examplesRow.style.cssText =
-    "display: flex; gap: 6px; overflow-x: auto; padding-bottom: 2px;";
+  examplesRow.style.cssText = "display: flex; flex-wrap: wrap; gap: 4px 6px;";
 
   const input = document.createElement("textarea");
   input.rows = 3;
@@ -486,9 +571,15 @@ export function mountAiChat(
       const used = findUsedColumns(projectStore.getState(), tableId);
       const useful: ColumnInfo[] = [];
       let other = 0;
-      for (const { name, matrix, hidden } of await listColumns(data, {
+      const listed = await listColumns(data, { signal });
+      // also in hidden groups such as obsm/: for spatial analyses
+      const coordinates = await findCoordinates(data, listed, {
         signal,
-      })) {
+      }).catch(() => {
+        signal.throwIfAborted();
+        return undefined;
+      });
+      for (const { name, matrix, hidden } of listed) {
         if (hidden || (tooBig && !used.has(name))) {
           other++;
           continue;
@@ -522,6 +613,7 @@ export function mountAiChat(
         tooBig,
         useful,
         other,
+        ...(coordinates === undefined ? {} : { coordinates }),
       });
     } catch (error) {
       if (signal.aborted) {
@@ -598,7 +690,8 @@ export function mountAiChat(
         const button = makeButton(
           text,
           () => void send(text),
-          `${smallButtonStyle}flex: none; white-space: nowrap;`,
+          `${smallButtonStyle}max-width: 100%; text-align: left; border-radius: 12px;` +
+            "color: var(--muted-foreground); border-color: var(--border);",
         );
         button.title = "Send this request";
         return button;
@@ -642,6 +735,7 @@ export function mountAiChat(
   function addToHistory(message: HTMLElement): void {
     history.insertBefore(message, thinking?.element ?? null);
     history.scrollTop = history.scrollHeight;
+    lastFrame = message;
   }
 
   /**
@@ -658,8 +752,15 @@ export function mountAiChat(
    * @param name - The tool
    * @param shownCall - The call, as it reads
    * @param result - The result for the model
+   * @param before - The message to show it above, e.g. the answer that the
+   * web searches were for; without it, at the end
    */
-  function showTool(name: string, shownCall: string, result: string): void {
+  function showTool(
+    name: string,
+    shownCall: string,
+    result: string,
+    before?: Element | null,
+  ): void {
     const failed = result.startsWith("Error");
     const message = document.createElement("div");
     message.dataset.who = "Tool";
@@ -679,7 +780,11 @@ export function mountAiChat(
     body.textContent = `${shownCall}\n→ ${result}`;
     details.append(line, body);
     message.append(details);
-    addToHistory(message);
+    if (before?.parentElement === history) {
+      history.insertBefore(message, before);
+    } else {
+      addToHistory(message);
+    }
     toolRows.push({ details, keepOpen: failed });
   }
 
@@ -853,6 +958,7 @@ export function mountAiChat(
     for (const url of chartUrls.splice(0)) {
       URL.revokeObjectURL(url);
     }
+    charts.length = 0;
     toolRows.length = 0;
     updateExamples();
     // a new chat gets a new Python
@@ -1134,7 +1240,8 @@ export function mountAiChat(
     settingsBox.style.display = folded ? "none" : "flex";
     summary.style.display = folded ? "" : "none";
     const skills = skillList.activeSkills().length;
-    summary.textContent = `${provider.name} · ${modelSelect.value} · key ✓${skills > 0 ? ` · ${skills} skill${skills === 1 ? "" : "s"}` : ""}`;
+    const searching = webSearch && provider.searchPrice !== undefined;
+    summary.textContent = `${provider.name} · ${modelSelect.value} · key ✓${skills > 0 ? ` · ${skills} skill${skills === 1 ? "" : "s"}` : ""}${searching ? " · web search" : ""}`;
     settingsButton.style.display = accepted ? "" : "none";
     settingsButton.setAttribute("aria-expanded", String(!folded));
   }
@@ -1348,13 +1455,13 @@ export function mountAiChat(
    */
   function instructionsFor(provider: Provider): string {
     return provider.wholeApp
-      ? `${instructions.replace(toolLimits, actionLimits)}\n\n${wholeAppInstructions}\n\n${skillInstructions}\n\n${codeInstructions}`
+      ? `${instructions.replace(toolLimits, actionLimits)}\n\n${wholeAppInstructions}\n\n${skillInstructions}\n\n${codeInstructions}\n\n${webInstructions}`
       : instructions;
   }
 
   /**
    * The tools for a service: for the strong models, also call_action, the
-   * skills and run_code
+   * skills and run_code, and look_at_chart if they see images
    */
   function toolsFor(provider: Provider) {
     return [
@@ -1365,9 +1472,26 @@ export function mountAiChat(
             ...skillToolDefinitions,
             runCodeDefinition,
             saveComputedTableDefinition,
+            ...(provider.seesImages ? [lookAtChartDefinition] : []),
           ]
         : []),
     ].map((definition) => definition.function);
+  }
+
+  /**
+   * Whether the model may search the web now: only with a service that can,
+   * when the user allows it
+   */
+  function searchAllowed(provider: Provider): boolean {
+    return webSearch && provider.searchPrice !== undefined;
+  }
+
+  /**
+   * Whether the model gets the image of each chart with the result of the
+   * code that drew it
+   */
+  function chartsSent(provider: Provider): boolean {
+    return seeCharts && provider.seesImages;
   }
 
   /**
@@ -1385,8 +1509,17 @@ export function mountAiChat(
       return summary;
     }
     const skills = describeSkills(skillList.activeSkills());
+    const settings = [
+      "# Settings of the chat",
+      webSearchState(searchAllowed(provider)),
+      !provider.seesImages
+        ? "- Charts: you cannot see images, only the descriptions of the charts."
+        : chartsSent(provider)
+          ? "- Charts: you see them: the image of each chart that your code draws comes with its result."
+          : "- Charts: you get their descriptions only; call look_at_chart to see one when the user asks.",
+    ].join("\n");
     const state = stateJson(projectStore.getState(), appStore.getState());
-    return `${summary}\n\n${skills}\n\n# The current app state, as JSON\n${state}`;
+    return `${summary}\n\n${skills}\n\n${settings}\n\n# The current app state, as JSON\n${state}`;
   }
 
   /**
@@ -1397,6 +1530,8 @@ export function mountAiChat(
    * @param model - The model
    * @param key - The API key of the service, or ""
    * @param context - The context of the turn, see {@link turnContext}
+   * @param search - Whether the model may search the web in this turn
+   * @param answerNow - Whether the model must answer now, without tools
    * @param onText - Called with the text so far, each time a piece arrives
    * @returns The answer, or an error message
    */
@@ -1405,6 +1540,8 @@ export function mountAiChat(
     model: string,
     key: string,
     context: string,
+    search: boolean,
+    answerNow: boolean,
     onText: (text: string) => void,
   ): Promise<ChatAnswer> {
     return provider.chat(
@@ -1415,6 +1552,8 @@ export function mountAiChat(
         context,
         messages,
         tools: toolsFor(provider),
+        webSearch: search,
+        answerNow,
       },
       onText,
       { signal },
@@ -1431,6 +1570,7 @@ export function mountAiChat(
     model: string,
     usage: Usage,
     requests: number,
+    extra: { searches: number; images: number },
   ): void {
     const message = history.lastElementChild;
     if (requests === 0 || message === null) {
@@ -1445,6 +1585,18 @@ export function mountAiChat(
       );
     }
     parts.push(`${count(usage.output)} output`);
+    if (extra.images > 0) {
+      // the services count the images as input tokens
+      parts.push(
+        `${extra.images} chart image${extra.images === 1 ? "" : "s"} (in the input)`,
+      );
+    }
+    const searchCost = extra.searches * (provider.searchPrice ?? 0);
+    if (extra.searches > 0) {
+      parts.push(
+        `${extra.searches} web search${extra.searches === 1 ? "" : "es"} (${dollars(searchCost)})`,
+      );
+    }
     const prices = provider.models.find(({ name }) => name === model)?.prices;
     if (prices === undefined) {
       parts.push("free");
@@ -1454,7 +1606,8 @@ export function mountAiChat(
           usage.cacheRead * prices.cacheRead +
           usage.cacheWrite * prices.cacheWrite +
           usage.output * prices.output) /
-        1_000_000;
+          1_000_000 +
+        searchCost;
       sessionCost += cost;
       parts.push(
         `≈ ${dollars(cost)}`,
@@ -1467,7 +1620,8 @@ export function mountAiChat(
     const toggle = document.createElement("summary");
     toggle.style.cssText = `${quietButtonStyle}width: fit-content;`;
     toggle.textContent = "Usage";
-    toggle.title = "The tokens of this request, and about how much they cost";
+    toggle.title =
+      "The tokens of this request, the web searches, and about how much they cost";
     const line = document.createElement("div");
     line.dataset.usage = "true";
     line.style.cssText = `${quietTextStyle}font-size: 11px; margin-top: 2px;`;
@@ -1538,9 +1692,15 @@ export function mountAiChat(
       if (question.matrix !== undefined) {
         return matrixColumns(data, question.matrix, { signal: stop });
       }
-      return (await listColumns(data, { signal: stop })).map(
-        ({ name, matrix }) => ({ name, matrix }),
-      );
+      return columnsForCode(data, { signal: stop });
+    }
+    // the name of a whole matrix, e.g. "obsm/spatial", reads nothing: say how
+    // to read its columns
+    const inner = await matrixColumns(data, question.column, {
+      signal: stop,
+    }).catch(() => []);
+    if (inner.length > 0) {
+      throw new Error(describeMatrixReading(question.column, inner));
     }
     const rows = data.getSize();
     if (rows > maxRowsToRead) {
@@ -2392,33 +2552,77 @@ export function mountAiChat(
   /** The addresses of the images of the charts, freed with the chat */
   const chartUrls: string[] = [];
 
+  /** The charts of this chat, "Chart 1" first, which the model can look at */
+  const charts: {
+    png: ArrayBuffer;
+    description: string;
+    width: number;
+    height: number;
+  }[] = [];
+
+  /**
+   * The images that go with the result of the tool that runs now, for the
+   * model, in base64; taken by the tool's message
+   */
+  const pendingImages: string[] = [];
+
+  /** The service of the turn in progress, which decides what the model sees */
+  let turnProvider: Provider | null = null;
+
+  /**
+   * Gives the model the image of a chart with the result of look_at_chart
+   *
+   * @param chart - Its number, as the chat shows it; without it, the last
+   * @returns The result for the model
+   */
+  function lookAtChart(chart?: number): string {
+    if (charts.length === 0) {
+      return "Error: no chart was drawn in this chat yet: draw one with Python first.";
+    }
+    const number = chart ?? charts.length;
+    const found = charts[number - 1];
+    if (found === undefined) {
+      return `Error: there is no Chart ${number}: the charts of this chat are Chart 1 to Chart ${charts.length}.`;
+    }
+    pendingImages.push(toBase64(found.png));
+    return `Done: the image of Chart ${number} (${found.width} × ${found.height} pixels) comes with this result; you see it in this turn only. Its description: ${found.description || "(no plots)"}`;
+  }
+
   /**
    * Shows the charts that Python code drew, each in a message with its
    * image and the buttons Copy and Save; only images that are PNG files
    *
-   * @param charts - The images, and what each shows
+   * @param drawn - The images, and what each shows
    * @param title - What the code computed, for the names of the files
-   * @returns What the charts show, for the model, which does not see them
+   * @returns What the charts show, for the model, whose images come with the
+   * result if the user lets the model see them
    */
   function showCharts(
-    charts: NonNullable<ScriptOutcome["charts"]>,
+    drawn: NonNullable<ScriptOutcome["charts"]>,
     title: string,
   ): string {
-    if (charts.length === 0) {
+    if (drawn.length === 0) {
       return "";
     }
-    const shown = charts.slice(0, maxCharts);
+    const shown = drawn.slice(0, maxCharts);
+    const sent = turnProvider !== null && chartsSent(turnProvider);
     const lines = shown.map(({ png, description }, index) => {
-      const number = index + 1;
       const checked = checkPng(png);
       if ("error" in checked) {
-        return `${number}. Not shown: ${checked.error}.`;
+        return `- Not shown: ${checked.error}.`;
       }
-      const fileName = chartFileName(title, number, shown.length);
+      charts.push({ png, description, ...checked });
+      const chartName = `Chart ${charts.length}`;
+      if (sent) {
+        pendingImages.push(toBase64(png));
+      }
+      const fileName = chartFileName(title, index + 1, shown.length);
       const image = new Blob([png], { type: "image/png" });
       const url = URL.createObjectURL(image);
       chartUrls.push(url);
-      const body = addFrame("Chart", "tool");
+      const body = addFrame(chartName, "tool");
+      // all the charts have the same kind of message
+      (body.parentElement ?? body).dataset.who = "Chart";
       const picture = document.createElement("img");
       picture.src = url;
       picture.alt = description;
@@ -2443,9 +2647,14 @@ export function mountAiChat(
         "display: flex; gap: 6px; justify-content: flex-end; white-space: normal;";
       buttons.append(copyButton, saveButton);
       body.append(buttons, picture);
-      return `${number}. ${checked.width} × ${checked.height} pixels: ${description || "(no plots)"}`;
+      return `- ${chartName}, ${checked.width} × ${checked.height} pixels: ${description || "(no plots)"}`;
     });
-    return `\n\nCharts, shown to the user in the chat (you do not see them; say what they show only from these words):\n${lines.join("\n")}`;
+    const seen = sent
+      ? "their images come with this result, for this turn only"
+      : turnProvider?.seesImages === true
+        ? "you do not see them; say what they show only from these words, or call look_at_chart if the user asks you to look at one"
+        : "you do not see them; say what they show only from these words";
+    return `\n\nCharts, shown to the user in the chat (${seen}):\n${lines.join("\n")}`;
   }
 
   /**
@@ -2651,7 +2860,9 @@ export function mountAiChat(
     changes: Change[],
     shownCall: string,
   ): Promise<{ result: string; warning: string }> {
-    const offered = !wholeAppTools.includes(name) || provider.wholeApp;
+    const offered =
+      (!wholeAppTools.includes(name) || provider.wholeApp) &&
+      (!imageTools.includes(name) || provider.seesImages);
     const tool =
       Object.hasOwn(tools, name) && offered ? tools[name] : undefined;
     if (tool === undefined) {
@@ -2698,6 +2909,7 @@ export function mountAiChat(
           addGitHubSkill,
           proposeSkillMd,
           keepComputedTable,
+          lookAtChart,
         },
         { signal: stopper.signal },
       );
@@ -2768,22 +2980,39 @@ export function mountAiChat(
     // the tokens of all the requests of this turn
     const usage: Usage = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 };
     let requests = 0;
+    // the same for the whole turn, as the context and the tools must be
+    const search = searchAllowed(provider);
+    turnProvider = provider;
+    let searches = 0;
+    let images = 0;
+    const sources: Source[] = [];
+    // the last answer of the model, under which the sources go
+    let finalAnswer: HTMLElement | null = null;
     // shown for the whole turn, below the messages, until the final answer
     startThinking();
     try {
       // the same for every step of this turn
       const context = await turnContext(provider);
-      for (let step = 1; step <= maxSteps; step++) {
+      const limit = provider.wholeApp ? maxSteps : maxStepsLocal;
+      // one more request after the last step of tools, for the final answer
+      for (let step = 1; step <= limit + 1; step++) {
+        const answerNow = step > limit;
         // the answer is shown while it arrives, in a message made when the
         // first piece of text comes
         let setText: ((text: string) => void) | null = null;
+        let answerFrame: HTMLElement | null = null;
         const answer: ChatAnswer = await askModel(
           provider,
           model,
           key,
           context,
+          search,
+          answerNow,
           (textSoFar) => {
-            setText ??= addMessage(persona.name, "assistant", true);
+            if (setText === null) {
+              setText = addMessage(persona.name, "assistant", true);
+              answerFrame = lastFrame;
+            }
             setText(textSoFar);
           },
         );
@@ -2803,12 +3032,53 @@ export function mountAiChat(
         ] as const) {
           usage[kind] += answer.message.usage?.[kind] ?? 0;
         }
+        const { webSearches = [] } = answer.message;
+        if (webSearches.length > 0) {
+          searches += webSearches.length;
+          // above the answer, since the searches came before it
+          showTool(
+            "web_search",
+            `web_search, run by ${provider.name}`,
+            describeSearches(webSearches),
+            answerFrame,
+          );
+        }
+        sources.push(...(answer.message.sources ?? []));
         const toolCalls = answer.message.toolCalls;
+        // a long turn of web searches goes on when it is sent again
+        if (
+          toolCalls.length === 0 &&
+          answer.message.paused === true &&
+          !answerNow
+        ) {
+          continue;
+        }
         if (toolCalls.length === 0) {
           // small models sometimes answer with an empty text
           if (setText === null) {
             show(persona.name, "(no text answer)", "assistant", true);
+            answerFrame = lastFrame;
           }
+          finalAnswer = answerFrame;
+          break;
+        }
+        if (answerNow) {
+          // calls made anyway are not run, but each gets a result, as the
+          // services want
+          for (const call of toolCalls) {
+            messages.push({
+              role: "tool",
+              callId: call.id,
+              name: call.name,
+              result:
+                "Error: not run: this request had reached its limit of steps.",
+            });
+          }
+          finalAnswer = answerFrame;
+          show(
+            "Error",
+            `Stopped after ${limit} steps: the model did not give a final answer.`,
+          );
           break;
         }
         let repeated = false;
@@ -2835,8 +3105,14 @@ export function mountAiChat(
           if (failedCalls.includes(callText)) {
             repeated = true;
           } else {
+            pendingImages.length = 0;
             outcome = await runTool(provider, name, args, changes, shownCall);
           }
+          // e.g. the image of a chart, which only the services that see
+          // images get
+          const toolImages = provider.seesImages ? pendingImages.splice(0) : [];
+          pendingImages.length = 0;
+          images += toolImages.length;
           if (outcome.result.startsWith("Error")) {
             failedCalls.push(callText);
           }
@@ -2849,6 +3125,7 @@ export function mountAiChat(
             callId: call.id,
             name,
             result: outcome.result,
+            ...(toolImages.length === 0 ? {} : { images: toolImages }),
           });
         }
         if (repeated) {
@@ -2858,10 +3135,15 @@ export function mountAiChat(
           );
           break;
         }
-        if (step === maxSteps) {
+        if (step === limit) {
+          // the next request asks for the answer, with what was found so far
+          const last = messages.at(-1);
+          if (last?.role === "tool") {
+            last.result += `\n\n${lastStepNote}`;
+          }
           show(
-            "Error",
-            `Stopped after ${maxSteps} steps without a final answer.`,
+            "Note",
+            `The model used ${limit} steps of tools, the most for one request: it now answers with what it found.`,
           );
         }
       }
@@ -2884,7 +3166,17 @@ export function mountAiChat(
       }
     }
     stopThinking();
-    showUsage(provider, model, usage, requests);
+    turnProvider = null;
+    // under the last answer, with the pages the model cited first
+    const lastMessage = finalAnswer ?? history.lastElementChild;
+    const unique = sources.filter(
+      (source, index) =>
+        sources.findIndex(({ url }) => url === source.url) === index,
+    );
+    if (unique.length > 0 && lastMessage !== null) {
+      lastMessage.append(makeSourcesRow(unique.slice(0, 12)));
+    }
+    showUsage(provider, model, usage, requests, { searches, images });
     // kept even if something failed later on, but not if another project
     // was opened in the meantime
     if (

@@ -304,6 +304,48 @@ function describeTableColumns(
 }
 
 /**
+ * The line about where the items of labels or points are, for spatial
+ * analyses: the columns that points are drawn from, or else the coordinates
+ * found in their tables, e.g. obsm/spatial[0] and obsm/spatial[1]
+ *
+ * @param object - The labels or points
+ * @param tableIds - Its tables, its own first
+ * @param tables - What the panel knows about the tables
+ * @returns The line, or `undefined` while a table is still being read
+ */
+function describeCoordinates(
+  object: ItemsObject,
+  tableIds: string[],
+  tables: TableKnowledge,
+): string | undefined {
+  const start = "  - coordinates (x, y), for spatial analyses:";
+  const own = annotatingTable(object);
+  const [x, y] = positionColumnsOf(object);
+  if (own !== undefined && x !== undefined && y !== undefined) {
+    return `${start} ${x} and ${y} (table ${own}), the columns the items are drawn from`;
+  }
+  let pending = false;
+  for (const tableId of tableIds) {
+    const info = tables.info.get(tableId);
+    if (info?.status !== "ready") {
+      pending ||= info === undefined || info.status === "reading";
+      continue;
+    }
+    if (info.coordinates !== undefined) {
+      const [first, second] = info.coordinates;
+      // e.g. obsm/spatial, which cannot be read as a whole
+      const matrix = /^(.*)\[\d+\]$/.exec(first)?.[1];
+      const how =
+        matrix === undefined
+          ? ""
+          : `; columns of the matrix ${matrix}: read each by this exact name, never ${matrix} alone`;
+      return `${start} ${first} and ${second} (table ${tableId}${how})`;
+    }
+  }
+  return pending ? undefined : `${start} none found in its tables`;
+}
+
+/**
  * The cluster columns labels or points can use, e.g. [obs/leiden, obs/kmeans]
  *
  * @param object - The labels or points
@@ -386,6 +428,10 @@ function describeItemsObjects(
       lines.push(
         ...describeTableColumns(object, tableId, tables.info.get(tableId)),
       );
+    }
+    const coordinates = describeCoordinates(object, tableIds, tables);
+    if (coordinates !== undefined) {
+      lines.push(coordinates);
     }
     // several cluster columns: the summary says which one "clusters" means
     const clusters = clusterColumns(object, tables);

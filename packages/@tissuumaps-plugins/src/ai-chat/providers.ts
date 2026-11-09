@@ -19,6 +19,12 @@
 //
 // An API key is sent only to the API of its own provider, and never shown:
 // error messages that could contain it go through hideKey.
+//
+// The images of charts go with the result of the tool that gave them, and
+// only within the current turn: in later turns the result says that the
+// image was seen, so that it is not paid for again in every request. Web
+// search is a tool that OpenAI and Anthropic run themselves; the panel only
+// turns it on, and shows the sources and the number of searches.
 
 /** The services the chat can use */
 export type ProviderId = "openai" | "anthropic" | "ollama" | "ollama-cloud";
@@ -42,11 +48,26 @@ export type ToolCall = {
   arguments: Record<string, unknown>;
 };
 
+/** A web page that the model found with a web search */
+export type Source = { url: string; title: string };
+
 /** An answer of the model */
 export type AssistantMessage = {
   role: "assistant";
   text: string;
   toolCalls: ToolCall[];
+  /**
+   * The searches that the service ran for this answer, by their query ("" if
+   * the service did not say it)
+   */
+  webSearches?: string[];
+  /** The pages of the web searches: those cited first, then the others */
+  sources?: Source[];
+  /**
+   * Whether the service paused a long turn of web searches: it goes on when
+   * the conversation is sent again as it is
+   */
+  paused?: boolean;
   /**
    * The answer as the API sent it, with what only that API understands (e.g.
    * the model's thinking); sent back as it is to the same kind of API
@@ -76,7 +97,17 @@ export type Prices = Usage;
 export type ChatMessage =
   | { role: "user"; text: string }
   | AssistantMessage
-  | { role: "tool"; callId: string; name: string; result: string };
+  | {
+      role: "tool";
+      callId: string;
+      name: string;
+      result: string;
+      /**
+       * PNG images that go with the result, in base64, e.g. a chart that the
+       * model looks at; sent only within the current turn
+       */
+      images?: string[];
+    };
 
 /** What the panel asks a provider */
 export type ChatRequest = {
@@ -92,6 +123,14 @@ export type ChatRequest = {
   context: string;
   messages: ChatMessage[];
   tools: ToolSpec[];
+  /** Whether the model may search the web, for the services that can */
+  webSearch?: boolean;
+  /**
+   * Whether the model must answer with text now, without calling tools, e.g.
+   * after the last step of tools of a request; the tools stay in the request,
+   * as the conversation holds calls of them
+   */
+  answerNow?: boolean;
 };
 
 /** The answer of the model, or an error message the user can act on */
@@ -114,6 +153,13 @@ export type Provider = {
    * told the types and the state of the whole app, besides the summary
    */
   wholeApp: boolean;
+  /** Whether the models see images, e.g. the charts of Python code */
+  seesImages: boolean;
+  /**
+   * The price of one web search, in dollars, for the services that search
+   * the web; without it, the service cannot search
+   */
+  searchPrice?: number;
   /**
    * Sends the conversation to the model
    *
@@ -179,6 +225,54 @@ function turnStart(messages: ChatMessage[]): number {
  */
 function withContext(text: string, context: string): string {
   return `[Context from the TissUUmaps chat panel, not typed by the user]\n${context}\n[End of the context]\n\n${text}`;
+}
+
+/** What replaces the images of a tool result after its turn */
+const imagesSeen =
+  "\n\n(The image that came with this result was shown to you in that turn only; it is not sent again. Call the tool again to see it.)";
+
+/**
+ * The images that go with a tool result: only within the current turn
+ *
+ * @param message - The tool result
+ * @param index - Its place in the conversation
+ * @param start - Where the current turn starts, see {@link turnStart}
+ * @returns The images to send, and the text of the result
+ */
+function resultImages(
+  message: Extract<ChatMessage, { role: "tool" }>,
+  index: number,
+  start: number,
+): { images: string[]; text: string } {
+  const images = message.images ?? [];
+  if (images.length === 0) {
+    return { images, text: message.result };
+  }
+  return index > start
+    ? { images, text: message.result }
+    : { images: [], text: `${message.result}${imagesSeen}` };
+}
+
+/** The most sources kept for one answer */
+const maxSources = 12;
+
+/**
+ * Keeps each page once, in order, at most a few, and only web addresses
+ *
+ * @param sources - The pages
+ * @returns The pages, each once
+ */
+function uniqueSources(sources: Source[]): Source[] {
+  const seen = new Set<string>();
+  return sources
+    .filter(({ url }) => {
+      if (!/^https?:\/\//.test(url) || seen.has(url)) {
+        return false;
+      }
+      seen.add(url);
+      return true;
+    })
+    .slice(0, maxSources);
 }
 
 /**
@@ -401,7 +495,18 @@ type OpenAiItem = {
   call_id?: string;
   name?: string;
   arguments?: string;
-  content?: { type: string; text?: string }[];
+  content?: {
+    type: string;
+    text?: string;
+    annotations?: { type: string; url?: string; title?: string }[];
+  }[];
+  /** In a web search: what it did, e.g. the query and the pages it found */
+  action?: {
+    type?: string;
+    query?: string;
+    queries?: string[];
+    sources?: { type?: string; url?: string }[];
+  };
 };
 
 /** An event of a streamed answer of OpenAI's Responses API */
@@ -452,14 +557,26 @@ function toOpenAiInput(
                 : message.text,
           },
         ];
-      case "tool":
+      case "tool": {
+        const { images, text } = resultImages(message, index, start);
         return [
           {
             type: "function_call_output",
             call_id: message.callId,
-            output: message.result,
+            output:
+              images.length === 0
+                ? text
+                : [
+                    { type: "input_text", text },
+                    ...images.map((data) => ({
+                      type: "input_image",
+                      image_url: `data:image/png;base64,${data}`,
+                      detail: "auto",
+                    })),
+                  ],
           },
         ];
+      }
       case "assistant":
         return (
           originalItems(message, index, start, "openai", keepThinking) ?? [
@@ -512,7 +629,16 @@ async function chatWithOpenAi(
  * reasoning that was sent
  */
 async function sendToOpenAi(
-  { model, key, instructions, context, messages, tools }: ChatRequest,
+  {
+    model,
+    key,
+    instructions,
+    context,
+    messages,
+    tools,
+    webSearch = false,
+    answerNow = false,
+  }: ChatRequest,
   keepThinking: boolean,
   onText: (text: string) => void,
   options?: { signal?: AbortSignal },
@@ -528,14 +654,22 @@ async function sendToOpenAi(
       model,
       instructions,
       input: toOpenAiInput(messages, context, keepThinking),
-      tools: tools.map((tool) => ({
-        type: "function",
-        ...tool,
-        strict: false,
-      })),
+      tools: [
+        ...tools.map((tool) => ({
+          type: "function",
+          ...tool,
+          strict: false,
+        })),
+        // run by OpenAI, which also gives the pages it found
+        ...(webSearch ? [{ type: "web_search" }] : []),
+      ],
+      ...(answerNow ? { tool_choice: "none" } : {}),
       stream: true,
       store: false,
-      include: ["reasoning.encrypted_content"],
+      include: [
+        "reasoning.encrypted_content",
+        ...(webSearch ? ["web_search_call.action.sources"] : []),
+      ],
     }),
     signal,
   });
@@ -595,15 +729,37 @@ async function sendToOpenAi(
   if (error !== undefined) {
     return { error: `OpenAI: ${hideKey(error, key)}` };
   }
-  const finalText = output
+  const parts = output
     .filter((item) => item.type === "message")
-    .flatMap((item) => item.content ?? [])
-    .map((part) => part.text ?? "")
-    .join("");
+    .flatMap((item) => item.content ?? []);
+  const finalText = parts.map((part) => part.text ?? "").join("");
+  const searches = output.filter(
+    (item) =>
+      item.type === "web_search_call" &&
+      (item.action?.type ?? "search") === "search",
+  );
+  const sources = uniqueSources([
+    ...parts
+      .flatMap((part) => part.annotations ?? [])
+      .filter((note) => note.type === "url_citation")
+      .map((note) => ({ url: note.url ?? "", title: note.title ?? "" })),
+    ...searches
+      .flatMap((item) => item.action?.sources ?? [])
+      .map((source) => ({ url: source.url ?? "", title: "" })),
+  ]);
   return {
     message: {
       role: "assistant",
       text: finalText === "" ? text : finalText,
+      ...(searches.length === 0
+        ? {}
+        : {
+            webSearches: searches.map(
+              ({ action }) =>
+                action?.query ?? action?.queries?.join("; ") ?? "",
+            ),
+          }),
+      ...(sources.length === 0 ? {} : { sources }),
       toolCalls: output
         .filter((item) => item.type === "function_call")
         .map((item) => ({
@@ -648,6 +804,9 @@ const anthropicUrl = "https://api.anthropic.com/v1";
  */
 const anthropicMaxTokens = 8192;
 
+/** The most web searches in one request to Anthropic, to keep the cost low */
+const maxSearches = 5;
+
 /** A content block of a message of Anthropic's Messages API */
 type AnthropicBlock = {
   type: string;
@@ -658,8 +817,17 @@ type AnthropicBlock = {
   name?: string;
   input?: unknown;
   tool_use_id?: string;
-  content?: string;
+  /**
+   * A tool result: text, or text and images; the result of a web search: the
+   * pages found, or an error
+   */
+  content?: string | unknown[];
+  /** In the text of an answer: the web pages it cites */
+  citations?: { type?: string; url?: string; title?: string }[] | null;
 };
+
+/** A page found by Anthropic's web search */
+type AnthropicSearchResult = { type?: string; url?: string; title?: string };
 
 /** An event of a streamed answer of Anthropic's Messages API */
 type AnthropicEvent = {
@@ -672,6 +840,10 @@ type AnthropicEvent = {
     thinking?: string;
     signature?: string;
     partial_json?: string;
+    /** In "citations_delta": a web page that the text cites */
+    citation?: { type?: string; url?: string; title?: string };
+    /** In "message_delta": why the answer ended, e.g. "pause_turn" */
+    stop_reason?: string | null;
   };
   error?: { message?: string };
   /** In "message_start": the usage so far */
@@ -686,6 +858,8 @@ type AnthropicUsage = {
   cache_read_input_tokens?: number | null;
   cache_creation_input_tokens?: number | null;
   output_tokens?: number;
+  /** The searches that Anthropic ran */
+  server_tool_use?: { web_search_requests?: number } | null;
 };
 
 /** A message of Anthropic's Messages API */
@@ -750,15 +924,26 @@ function toAnthropicMessages(
           },
         ]);
         break;
-      case "tool":
+      case "tool": {
+        const { images, text } = resultImages(message, index, start);
         add("user", [
           {
             type: "tool_result",
             tool_use_id: message.callId,
-            content: message.result,
+            content:
+              images.length === 0
+                ? text
+                : [
+                    { type: "text", text },
+                    ...images.map((data) => ({
+                      type: "image",
+                      source: { type: "base64", media_type: "image/png", data },
+                    })),
+                  ],
           },
         ]);
         break;
+      }
       case "assistant":
         add(
           "assistant",
@@ -817,7 +1002,16 @@ async function chatWithAnthropic(
  * thinking that was sent
  */
 async function sendToAnthropic(
-  { model, key, instructions, context, messages, tools }: ChatRequest,
+  {
+    model,
+    key,
+    instructions,
+    context,
+    messages,
+    tools,
+    webSearch = false,
+    answerNow = false,
+  }: ChatRequest,
   keepThinking: boolean,
   onText: (text: string) => void,
   options?: { signal?: AbortSignal },
@@ -837,11 +1031,24 @@ async function sendToAnthropic(
         },
       ],
       messages: toAnthropicMessages(messages, context, keepThinking),
-      tools: tools.map(({ name, description, parameters }) => ({
-        name,
-        description,
-        input_schema: parameters,
-      })),
+      tools: [
+        ...tools.map(({ name, description, parameters }) => ({
+          name,
+          description,
+          input_schema: parameters,
+        })),
+        // run by Anthropic: the basic version, which all the models have
+        ...(webSearch
+          ? [
+              {
+                type: "web_search_20250305",
+                name: "web_search",
+                max_uses: maxSearches,
+              },
+            ]
+          : []),
+      ],
+      ...(answerNow ? { tool_choice: { type: "none" } } : {}),
       stream: true,
     }),
     signal,
@@ -866,11 +1073,27 @@ async function sendToAnthropic(
   const json = new Map<number, string>();
   let error: string | undefined;
   const usage: Usage = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 };
+  let searchCount = 0;
+  let stopReason: string | undefined;
+  /**
+   * The text of the answer: with citations, one sentence comes in several
+   * text blocks, which are joined as they are; text before and after other
+   * blocks, e.g. a web search, goes in paragraphs
+   */
   function textSoFar(): string {
-    return blocks
-      .filter((block) => block.type === "text")
-      .map((block) => block.text ?? "")
-      .join("\n\n");
+    let text = "";
+    let previous: string | undefined;
+    for (const block of blocks) {
+      if (block === undefined) {
+        continue;
+      }
+      if (block.type === "text") {
+        const gap = text !== "" && previous !== "text" ? "\n\n" : "";
+        text += gap + (block.text ?? "");
+      }
+      previous = block.type;
+    }
+    return text;
   }
   /** Keeps the numbers that Anthropic sends, which are totals so far */
   function countTokens(tokens: AnthropicUsage | undefined): void {
@@ -878,6 +1101,7 @@ async function sendToAnthropic(
     usage.cacheRead = tokens?.cache_read_input_tokens ?? usage.cacheRead;
     usage.cacheWrite = tokens?.cache_creation_input_tokens ?? usage.cacheWrite;
     usage.output = tokens?.output_tokens ?? usage.output;
+    searchCount = tokens?.server_tool_use?.web_search_requests ?? searchCount;
   }
   await readServerEvents<AnthropicEvent>(
     response,
@@ -909,11 +1133,22 @@ async function sendToAnthropic(
           if (event.delta.partial_json !== undefined) {
             json.set(index, (json.get(index) ?? "") + event.delta.partial_json);
           }
+          if (event.delta.citation !== undefined) {
+            block.citations = [
+              ...(block.citations ?? []),
+              event.delta.citation,
+            ];
+          }
           break;
         case "content_block_stop":
           if (block?.type === "tool_use") {
             block.input = parseArguments(json.get(index));
+          } else if (block?.type === "server_tool_use" && json.has(index)) {
+            block.input = parseArguments(json.get(index));
           }
+          break;
+        case "message_delta":
+          stopReason = event.delta?.stop_reason ?? stopReason;
           break;
         case "error":
           error ??= event.error?.message ?? "unknown error";
@@ -926,10 +1161,41 @@ async function sendToAnthropic(
     return { error: `Anthropic: ${hideKey(error, key)}` };
   }
   const items = blocks.filter((block) => block !== undefined);
+  const sources = uniqueSources([
+    ...items
+      .flatMap((block) => block.citations ?? [])
+      .map((cited) => ({ url: cited.url ?? "", title: cited.title ?? "" })),
+    ...items
+      .filter((block) => block.type === "web_search_tool_result")
+      // an error is one object instead of a list of pages
+      .flatMap((block) =>
+        Array.isArray(block.content)
+          ? (block.content as AnthropicSearchResult[])
+          : [],
+      )
+      .map((page) => ({ url: page.url ?? "", title: page.title ?? "" })),
+  ]);
+  // only the searches that ran are billed, as the usage counts them
+  const queries = items
+    .filter(
+      (block) =>
+        block.type === "server_tool_use" && block.name === "web_search",
+    )
+    .map((block) => {
+      const { query } = (block.input ?? {}) as { query?: unknown };
+      return typeof query === "string" ? query : "";
+    })
+    .slice(0, searchCount);
+  while (queries.length < searchCount) {
+    queries.push("");
+  }
   return {
     message: {
       role: "assistant",
       text: textSoFar(),
+      ...(queries.length === 0 ? {} : { webSearches: queries }),
+      ...(sources.length === 0 ? {} : { sources }),
+      ...(stopReason === "pause_turn" ? { paused: true } : {}),
       toolCalls: items
         .filter((block) => block.type === "tool_use")
         .map((block) => ({
@@ -1125,7 +1391,14 @@ function toOllamaMessages(messages: ChatMessage[]): OllamaMessage[] {
  * for the online models, on Ollama's servers
  */
 async function chatWithOllama(
-  { model, instructions, context, messages, tools }: ChatRequest,
+  {
+    model,
+    instructions,
+    context,
+    messages,
+    tools,
+    answerNow = false,
+  }: ChatRequest,
   onText: (text: string) => void,
   options?: { signal?: AbortSignal },
 ): Promise<ChatAnswer> {
@@ -1140,7 +1413,10 @@ async function chatWithOllama(
         { role: "system", content: `${instructions}\n\n${context}` },
         ...toOllamaMessages(messages),
       ],
-      tools: tools.map((tool) => ({ type: "function", function: tool })),
+      // Ollama has no tool_choice: without tools, the model can only answer
+      tools: answerNow
+        ? []
+        : tools.map((tool) => ({ type: "function", function: tool })),
       stream: true,
       options: { num_ctx: contextTokens },
     }),
@@ -1197,6 +1473,8 @@ async function chatWithOllama(
  *
  * The prices are those published by OpenAI and Anthropic in October 2026,
  * only to estimate the cost of the answers: the bill of the service counts.
+ * A web search costs $10 per 1,000 searches with both (November 2026), and
+ * the pages it reads count as input tokens.
  */
 export const providers: Provider[] = [
   {
@@ -1221,6 +1499,8 @@ export const providers: Provider[] = [
     ],
     needsKey: true,
     wholeApp: true,
+    seesImages: true,
+    searchPrice: 0.01,
     chat: chatWithOpenAi,
     checkKey: checkOpenAiKey,
   },
@@ -1246,6 +1526,8 @@ export const providers: Provider[] = [
     ],
     needsKey: true,
     wholeApp: true,
+    seesImages: true,
+    searchPrice: 0.01,
     chat: chatWithAnthropic,
     checkKey: checkAnthropicKey,
   },
@@ -1255,6 +1537,7 @@ export const providers: Provider[] = [
     models: [{ name: "gemma4:e2b", note: "local" }],
     needsKey: false,
     wholeApp: false,
+    seesImages: false,
     chat: chatWithOllama,
   },
   {
@@ -1263,6 +1546,7 @@ export const providers: Provider[] = [
     models: [{ name: "gemma4:cloud", note: "online" }],
     needsKey: false,
     wholeApp: false,
+    seesImages: false,
     chat: chatWithOllama,
   },
 ];

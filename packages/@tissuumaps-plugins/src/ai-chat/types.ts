@@ -139,6 +139,14 @@ export type ToolContext = {
     table: string,
     options?: { fileName?: string },
   ) => Promise<string>;
+  /**
+   * Gives the model the image of a chart of this chat, with the result of
+   * the tool, for the current turn only
+   *
+   * @param chart - Its number, as the chat shows it; without it, the last
+   * @returns The result for the model
+   */
+  lookAtChart: (chart?: number) => string;
 };
 
 /** How code runs in the sandbox */
@@ -175,6 +183,11 @@ export type TableInfo =
       tooBig: boolean;
       useful: ColumnInfo[];
       other: number;
+      /**
+       * The columns of the x and the y of each item, for spatial analyses,
+       * e.g. ["obsm/spatial[0]", "obsm/spatial[1]"]
+       */
+      coordinates?: [string, string];
     };
 
 /** A column useful for colors and filters */

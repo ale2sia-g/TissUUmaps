@@ -82,6 +82,28 @@ export const saveComputedTableDefinition = {
   },
 };
 
+/** The look_at_chart tool, only offered to the services that see images */
+export const lookAtChartDefinition = {
+  type: "function",
+  function: {
+    name: "look_at_chart",
+    description:
+      'Look at a chart that Python drew in this chat, e.g. "Chart 2": its image comes with the result, for this turn only. ' +
+      "Use it when the user asks you to look at a chart or what it shows, or when its description is not enough to answer. " +
+      "Each image costs about a thousand tokens.",
+    parameters: {
+      type: "object",
+      properties: {
+        chart: {
+          type: "integer",
+          description:
+            'The number of the chart, as the chat shows it ("Chart 2" is 2). Without it: the last chart.',
+        },
+      },
+    },
+  },
+};
+
 /** What the strong models are told about run_code, with the fixed instructions */
 export const codeInstructions = [
   "# Your own code",
@@ -94,9 +116,11 @@ export const codeInstructions = [
   "  cluster than in the others, with a statistical test;",
   "- correlations between columns or genes;",
   "- thresholds: e.g. how many cells have a value above a limit, and in which groups;",
-  "- spatial analyses with the coordinates of the cells or points (columns such as x and y,",
-  '  or a matrix such as "obsm/spatial", whose columns are "obsm/spatial[0]" and',
-  '  "obsm/spatial[1]"): distances, neighbors, density, which groups lie near each other.',
+  "- spatial analyses with the coordinates of the cells or points: distances, neighbors,",
+  "  density, which groups lie near each other. The summary gives the coordinates of each",
+  '  object ("coordinates (x, y)"), e.g. x and y, geometry[x] and geometry[y], or the two',
+  '  columns of the matrix obsm/spatial, "obsm/spatial[0]" and "obsm/spatial[1]": read',
+  '  exactly those names; "obsm/spatial" alone is a matrix and reads nothing.',
   "Skills are useful but not needed: when a skill that is on does the task, use it, since it",
   "holds the method the user wants; otherwise write the code yourself. When the user asks",
   "what analyses are possible, tell them all this, and never that a skill is needed first.",
@@ -113,9 +137,11 @@ export const codeInstructions = [
   "JavaScript must be a module: export default async function (tm) { ... }. Python must",
   "define async def main(tm): ... With tm it can read the data:",
   "- await tm.tables(): the tables, as [{ id, name }] (dicts in Python)",
-  "- await tm.columns(table): the columns of a table, as [{ name, matrix }]; matrix is true",
-  '  for a matrix such as "X" or "obsm/spatial", whose columns await tm.columns(table, "X")',
-  '  lists (e.g. "X[EPCAM]")',
+  "- await tm.columns(table): the columns of a table, as [{ name, matrix }]; coordinates is",
+  "  true on the columns of the x and the y of the items (or on their matrix). A matrix, such",
+  '  as "X" or "obsm/spatial", has matrix true, its size, its first columns (e.g.',
+  '  "obsm/spatial[0]", "X[EPCAM]") and how to read them: one column at a time, never by the',
+  '  name of the matrix alone; await tm.columns(table, "X") lists all its columns',
   '- await tm.read(table, column): the values of a column (e.g. "obs/leiden" or "X[EPCAM]"),',
   "  one per row, in the order of the rows of the table, so that the values of two columns",
   "  of the same table belong together row by row; in Python, a numpy array (of objects,",
@@ -151,14 +177,29 @@ export const codeInstructions = [
   "not count): in big tables go over the rows only a few times, and for neighbors use a",
   "grid or a k-d tree instead of comparing every pair.",
   "",
+  "# Groups named by numbers",
+  'Groups whose names are numbers written as text, e.g. the leiden clusters "0", "1", …',
+  '"15", are numbers to the user: always sort them as numbers (0, 1, 2, …, 9, 10, 11), never',
+  "as text (0, 1, 10, 11, …, 2), in results, tables, files, charts (e.g. the rows and columns",
+  "of a heatmap) and your answers. Results of a skill or a library often come in text order",
+  "(e.g. from numpy.unique, sorted() or pandas): put them in number order before you return,",
+  "save or draw them. In Python, e.g. order = sorted(names, key=lambda n: (0, float(n)) if",
+  "str(n).replace('.', '', 1).lstrip('-').isdigit() else (1, str(n))), then",
+  "frame.reindex(index=order, columns=order); in JavaScript, names.sort((a, b) =>",
+  "a.localeCompare(b, undefined, { numeric: true })).",
+  "",
   "# Charts",
   "In Python you can draw charts with matplotlib (import matplotlib.pyplot as plt): every",
-  "figure still open when the code ends is shown to the user in the chat, as an image they",
-  "can copy and save. You do not see it: you get only a short description (titles, axes,",
-  "what each plot holds), so say what it shows only from that and from the numbers. Give",
-  "each chart a title and labeled axes; do not call plt.show() or plt.savefig(). Draw one",
-  `when the user asks for a chart, or when it shows a result much better than numbers; at`,
-  `most ${maxCharts} per code. JavaScript cannot draw charts. Also give the main numbers in your answer.`,
+  'figure still open when the code ends is shown to the user in the chat ("Chart 1", "Chart',
+  '2", …), as an image they can copy and save. Usually you do not see it: you get a short',
+  "description (titles, axes, what each plot holds), so say what it shows only from that",
+  'and from the numbers. If the context says "Charts: you see them", the images come with',
+  'the result of the code. When the user asks you to look at a chart (e.g. "look at the',
+  'chart and tell me what you see"), call look_at_chart with its number: you see the image',
+  "in this turn only. Never say that you see a chart whose image you did not get. Give each",
+  "chart a title and labeled axes; do not call plt.show() or plt.savefig(). Draw one when",
+  `the user asks for a chart, or when it shows a result much better than numbers; at most`,
+  `${maxCharts} per code. JavaScript cannot draw charts. Also give the main numbers in your answer.`,
   "",
   "What you cannot do yet: read the pixels of images. The code has no internet:",
   "it cannot download anything, and in Python only the packages of Pyodide can be imported",
@@ -224,6 +265,29 @@ export async function runCodeTool(
       ...(skill === undefined ? {} : { skill }),
     },
   );
+}
+
+/**
+ * Runs the look_at_chart tool: the panel gives the image of the chart with
+ * the result
+ *
+ * @param args - The arguments of the tool call
+ * @param context - How to look at a chart
+ * @returns The result for the model
+ */
+export function lookAtChartTool(
+  args: ToolArguments,
+  context: ToolContext,
+): string {
+  const chart = args["chart"];
+  if (chart === undefined || chart === null) {
+    return context.lookAtChart();
+  }
+  const number = typeof chart === "string" ? Number(chart) : chart;
+  if (typeof number !== "number" || !Number.isInteger(number)) {
+    return 'Error: give the number of the chart, e.g. 2 for "Chart 2".';
+  }
+  return context.lookAtChart(number);
 }
 
 /**

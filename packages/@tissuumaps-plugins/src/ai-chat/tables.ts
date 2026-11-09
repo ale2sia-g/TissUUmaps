@@ -189,6 +189,133 @@ export async function matrixColumns(
 }
 
 /**
+ * Says how to read the columns of a matrix, whose name alone reads nothing,
+ * e.g. '"obsm/spatial" is a matrix with 2 columns: read "obsm/spatial[0]" and
+ * "obsm/spatial[1]", one at a time'
+ *
+ * @param name - The matrix name
+ * @param columns - Its columns, from {@link matrixColumns}
+ * @returns The text
+ */
+export function describeMatrixReading(name: string, columns: string[]): string {
+  const quoted = columns.map((column) => `"${column}"`);
+  if (columns.length === 0) {
+    return `"${name}" is a matrix: tm.columns(table, "${name}") lists its columns, which are read one at a time`;
+  }
+  if (columns.length <= 4) {
+    const all =
+      quoted.length === 1
+        ? quoted[0]
+        : `${quoted.slice(0, -1).join(", ")} and ${quoted.at(-1)}`;
+    return `"${name}" is a matrix with ${columns.length} column${columns.length === 1 ? "" : "s"}: read ${all}, one at a time`;
+  }
+  return (
+    `"${name}" is a matrix with ${columns.length} columns: read them one at a time, ` +
+    `e.g. ${quoted[0]}; tm.columns(table, "${name}") lists them all`
+  );
+}
+
+/** Matrices that hold where each item is, e.g. obsm/spatial of AnnData */
+const coordinateMatrix = /^obsm\/(x_)?spatial$/i;
+
+/** Embeddings, whose two axes are not places in the tissue */
+const embedding = /umap|tsne|t_sne|pca|diffmap/i;
+
+/**
+ * Finds the two columns that tell where each item (cell, point) is, for
+ * spatial analyses: the first two columns of a matrix like obsm/spatial, or
+ * two columns named alike, e.g. "geometry[x]" and "geometry[y]", "x" and
+ * "y", or "x_centroid" and "y_centroid"
+ *
+ * @param data - The table data
+ * @param columns - The columns of the table, from {@link listColumns}
+ * @param options - Optional abort signal
+ * @returns The x and the y column, or `undefined` if none were found
+ */
+export async function findCoordinates(
+  data: TableData,
+  columns: { name: string; matrix: boolean }[],
+  options?: { signal?: AbortSignal },
+): Promise<[string, string] | undefined> {
+  const { signal } = options ?? {};
+  for (const { name, matrix } of columns) {
+    if (matrix && coordinateMatrix.test(name)) {
+      const [x, y] = await matrixColumns(data, name, { signal });
+      if (x !== undefined && y !== undefined) {
+        return [x, y];
+      }
+    }
+  }
+  const names = new Set(
+    columns
+      .filter(({ name, matrix }) => !matrix && !embedding.test(name))
+      .map(({ name }) => name),
+  );
+  for (const name of names) {
+    // an x on its own: the whole name, or between "/", "_", "[", "]"
+    for (const match of name.matchAll(/(?<=^|[/_[])[xX](?=$|[_\]])/g)) {
+      const y =
+        name.slice(0, match.index) +
+        (match[0] === "x" ? "y" : "Y") +
+        name.slice(match.index + 1);
+      if (names.has(y)) {
+        return [name, y];
+      }
+    }
+  }
+  return undefined;
+}
+
+/** A column as tm.columns gives it to code */
+export type CodeColumn = {
+  name: string;
+  matrix: boolean;
+  /** For a matrix: how many columns it has, the first ones, and how to read them */
+  size?: number;
+  columns?: string[];
+  how?: string;
+  /** Whether the column holds the x or the y of the items, or the matrix both */
+  coordinates?: boolean;
+};
+
+/**
+ * The columns of a table for tm.columns: each matrix with its size, its
+ * first columns and how to read them, and the coordinates marked
+ *
+ * @param data - The table data
+ * @param options - Optional abort signal
+ * @returns The columns
+ */
+export async function columnsForCode(
+  data: TableData,
+  options?: { signal?: AbortSignal },
+): Promise<CodeColumn[]> {
+  const { signal } = options ?? {};
+  const listed = await listColumns(data, { signal });
+  const coordinates = (await findCoordinates(data, listed, { signal })) ?? [];
+  const result: CodeColumn[] = [];
+  for (const { name, matrix } of listed) {
+    const column: CodeColumn = { name, matrix };
+    if (matrix) {
+      const inner = await matrixColumns(data, name, { signal });
+      column.size = inner.length;
+      column.columns = inner.slice(0, 10);
+      column.how = describeMatrixReading(name, inner);
+    }
+    if (
+      coordinates.some(
+        (coordinate) =>
+          coordinate === name || (matrix && coordinate.startsWith(`${name}[`)),
+      )
+    ) {
+      column.coordinates = true;
+    }
+    result.push(column);
+  }
+  return result;
+}
+
+/**
  * Whether the columns of a matrix are named after genes, rather than only
  * numbered (X[0], X[1], ...)
  *

@@ -1,5 +1,9 @@
 import { callAction } from "./call-action";
-import { runCodeTool, saveComputedTableTool } from "./code-tool";
+import {
+  lookAtChartTool,
+  runCodeTool,
+  saveComputedTableTool,
+} from "./code-tool";
 import {
   colorByColumn,
   setColor,
@@ -291,6 +295,8 @@ export const tools: Record<string, Tool> = {
   save_computed_table: saveComputedTableTool,
   add_skill_from_github: addSkillFromGitHub,
   propose_skill_instructions: proposeSkillInstructions,
+  // only offered to the services that see images, see imageTools
+  look_at_chart: lookAtChartTool,
 };
 
 /** The tools only offered to OpenAI and Anthropic, which know the whole app */
@@ -304,3 +310,6 @@ export const wholeAppTools = [
   "add_skill_from_github",
   "propose_skill_instructions",
 ];
+
+/** The tools only offered to the services whose models see images */
+export const imageTools = ["look_at_chart"];

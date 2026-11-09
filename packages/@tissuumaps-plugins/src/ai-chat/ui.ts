@@ -263,6 +263,8 @@ export const toolIcons: Record<string, string> = {
   read_skill_file: "📄",
   run_script: "🧪",
   run_code: "🧮",
+  look_at_chart: "🖼",
+  web_search: "🌐",
   save_computed_table: "💾",
   add_skill_from_github: "📦",
   propose_skill_instructions: "📝",

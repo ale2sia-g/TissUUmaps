@@ -37,8 +37,8 @@ function fakeGitHub(options: {
   headers?: Record<string, string>;
 }) {
   const asked: string[] = [];
-  const fetchFile = (url: string | URL) => {
-    const address = url.toString();
+  const fetchFile = (url: string | URL | Request) => {
+    const address = url instanceof Request ? url.url : url.toString();
     asked.push(address);
     const json = (value: unknown) =>
       Promise.resolve(
@@ -79,7 +79,7 @@ function fakeGitHub(options: {
       return Promise.resolve(
         content === undefined
           ? new Response("", { status: 404 })
-          : new Response(content),
+          : new Response(content as BodyInit),
       );
     }
     return Promise.resolve(new Response("", { status: 404 }));
